@@ -27,8 +27,6 @@ Variable(name, indices...) = Variable("$(name)$(join(map_subscripts.(indices), "
 Base.show(io::IO, v::Variable) = print(io, v.name)
 
 
-dump(:(Base.Threads.identity([12, 32])))
-
 struct Constant <: Expression
     value::Number
 end
