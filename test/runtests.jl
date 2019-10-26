@@ -12,4 +12,8 @@ using Test
     e4 = sin(x^3+3)
     @test e3 == e4
     @test e4.func == (:Base, :sin)
+
+    @test convert(Expr, x^2+3*x) == :(x^2+3*x)
+    @test convert(Expr, x^2+3*sin(x)^5) == :(x^2+3*sin(x)^5)
+
 end
