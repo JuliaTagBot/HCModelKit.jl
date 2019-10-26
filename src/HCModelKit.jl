@@ -1,5 +1,7 @@
 module HCModelKit
 
+using OrderedCollections: OrderedDict
+
 export Expression, Constant, Variable, Operation, Instruction, InstructionList
 
 abstract type Expression end
@@ -114,73 +116,116 @@ function derivative(M::Symbol, f::Symbol, args::NTuple{N,Symbol}, i::Int = 1) wh
     end
 end
 
-
+struct InstructionId <: Expression
+    var::Symbol
+    n::Int
+end
+Base.convert(::Type{Expr}, id::InstructionId) = Symbol(id.var, id.n)
 
 struct Instruction
     func::Tuple{Union{Expr,Symbol},Symbol} # module, function name
-    args::Vector{Any}
+    args::Vector{Union{InstructionId, Constant, Variable}}
 end
 
-Instruction(x::Variable) = Instruction((:Base, :identity), [x.name])
-Instruction(x::Constant) = Instruction((:Base, :identity), [x.value])
+Instruction(x::Variable) = Instruction((:Base, :identity), [x])
+Instruction(x::Constant) = Instruction((:Base, :identity), [x])
+
+Base.hash(I::Instruction, h::UInt) = foldr(hash, I.args, init = hash(I.func, h))
 
 function Base.convert(::Type{Expr}, op::Instruction)
     if op.func[1] == :Base
         if op.func[2] == :identity
             op.args[1]
         else
-            Expr(:call, op.func[2], op.args...)
+            Expr(:call, op.func[2], convert.(Expr, op.args)...)
         end
     else
-        Expr(:call, :($(op.func[1]).$(op.func[2])), op.args...)
+        Expr(:call, :($(op.func[1]).$(op.func[2])), convert.(Expr, op.args)...)
     end
 end
+
 Base.show(io::IO, op::Instruction) = print(io, convert(Expr, op))
 Base.:(==)(a::Instruction, b::Instruction) = a.func == b.func && a.args == b.args
 
-struct InstructionList <: AbstractVector{Instruction}
-    instructions::Vector{Instruction}
+
+
+struct InstructionList
+    instructions::OrderedDict{Instruction,InstructionId}
+    derivatives::Dict{InstructionId,InstructionId}
     var::Symbol
+    n::Base.RefValue{Int}
 end
-
-Base.push!(v::InstructionList, i::Instruction) = push!(v.instructions, i)
-Base.length(v::InstructionList) = length(v.instructions)
-Base.size(v::InstructionList) = (length(v),)
-Base.getindex(v::InstructionList, i) = getindex(v.instructions, i)
-Base.setindex!(v::InstructionList, instr::Instruction, i) =
-    getindex(v.instructions, instr, i)
-
-function InstructionList(op::Expression, variables::Vector{Variable}, var::Symbol)
-    list = InstructionList(Instruction.(variables), var)
-    instruction_list!(list, op)
+function InstructionList(; var::Symbol = :ι, n::Base.RefValue{Int} = Ref(0))
+    instructions = OrderedDict{Instruction,InstructionId}()
+    derivatives = Dict{InstructionId, InstructionId}()
+    InstructionList(instructions, derivatives, var, n)
+end
+function InstructionList(op::Expression; kwargs...)
+    list = InstructionList(; kwargs...)
+    push!(list, op)
     list
 end
 
-function instruction_list!(list::InstructionList, op::Operation)
+function Base.push!(v::InstructionList, i::Instruction)
+    if haskey(v.instructions, i)
+        return v.instructions[i]
+    else
+        id = InstructionId(v.var, v.n[] += 1)
+        push!(v.instructions, i => id)
+        return id
+    end
+end
+Base.push!(list::InstructionList, x::Constant) = push!(list, Instruction(x))
+Base.push!(list::InstructionList, x::Variable) = push!(list, Instruction(x))
+function Base.push!(list::InstructionList, op::Operation)
     args = map(op.args) do arg
         if arg isa Operation
-            instruction_list!(list, arg)
-            Symbol(list.var, length(list))
-        elseif arg isa Variable
-            arg.name
-        elseif arg isa Constant
-            arg.value
+            push!(list, arg)
+        else
+            arg
         end
     end
 
     push!(list, Instruction(op.func, args))
 end
 
+Base.length(v::InstructionList) = length(v.instructions)
+Base.iterate(v::InstructionList) = iterate(v.instructions)
+Base.iterate(v::InstructionList, state) = iterate(v.instructions, state)
+Base.eltype(v::Type{InstructionList}) = eltype(v.instructions)
+# Base.size(v::InstructionList) = (length(v),)
+# Base.getindex(v::InstructionList, i) = getindex(v.instructions, i)
+# Base.setindex!(v::InstructionList, instr::Instruction, i) =
+#     getindex(v.instructions, instr, i)
+
+
 function Base.show(io::IO, ::MIME"text/plain", list::InstructionList)
     println(io, "InstructionList:")
-    N = length(list)
-    for i = 1:N
-        print(io, list.var, i, " = ", convert(Expr, list[i]))
-        if i < N
-            println(io)
-        end
+    for (instr, id) in list
+        println(io, convert(Expr, id), " = ", convert(Expr, instr))
     end
 end
+
+
+
+
+function derivative!(list::InstructionList, instr::Instruction, id::InstructionId)
+    if instr.func == (:Base, :*)
+        derivatives = [instr.args[2], instr.args[1]]
+    end
+    d = chain_rule(instr.args[1], derivatives[1], list)
+    for i in 2:length(derivatives)
+        d += chain_rule(instr.args[i], derivatives[i], list)
+    end
+    d_id = push!(list, d)
+    list.derivatives[id] = d_id
+    list
+end
+
+chain_rule(arg::InstructionId, deriv, list::InstructionList) = deriv * list.derivatives[arg]
+chain_rule(arg::Variable, deriv, list::InstructionList) = deriv
+chain_rule(arg::Constant, deriv, list::InstructionList) = Constant(0)
+
 
 
 # function derivative(op::Operation, args::NTuple{N,Variable}, i::Int = 1) where N
