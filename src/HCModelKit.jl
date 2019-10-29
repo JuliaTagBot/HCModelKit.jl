@@ -4,7 +4,7 @@ using OrderedCollections: OrderedDict
 
 export Expression, Constant, Variable, Operation, Instruction, InstructionList
 
-export differentiate, compile, evaluate, evaluate!, evaluate_gradient
+export differentiate, compile, evaluate, evaluate!, evaluate_gradient, @var, subs, variables
 
 abstract type Expression end
 
@@ -34,10 +34,48 @@ Variable(s::AbstractString) = Variable(Symbol(s))
 
 name(v::Variable) = v.name
 
+Base.isless(u::Variable, v::Variable) = isless(u.name, v.name)
 Base.:(==)(x::Variable, y::Variable) = x.name == y.name
 Base.show(io::IO, v::Variable) = print(io, v.name)
 Base.convert(::Type{Expr}, x::Variable) = x.name
 Base.convert(::Type{Expression}, x::Symbol) = Variable(x)
+
+macro var(args...)
+    vars, exprs = buildvars(args)
+    :($(foldl((x, y) -> :($x; $y), exprs, init = :())); $(Expr(:tuple, esc.(vars)...)))
+end
+
+function var_array(prefix, indices...)
+    map(i -> Variable(prefix, i...), Iterators.product(indices...))
+end
+
+function buildvar(var)
+    if isa(var, Symbol)
+        var, :($(esc(var)) = $Variable($"$var"))
+    else
+        isa(var, Expr) || error("Expected $var to be a variable name")
+        Base.Meta.isexpr(
+            var,
+            :ref,
+        ) || error("Expected $var to be of the form varname[idxset]")
+        (2 ≤ length(var.args)) || error("Expected $var to have at least one index set")
+        varname = var.args[1]
+        prefix = string(varname)
+        varname, :($(esc(varname)) = var_array($prefix, $(esc.(var.args[2:end])...)))
+    end
+end
+
+function buildvars(args)
+    vars = Symbol[]
+    exprs = []
+    for arg in args
+        var, expr = buildvar(arg)
+        push!(vars, var)
+        push!(exprs, expr)
+    end
+    vars, exprs
+end
+
 
 # CONSTANTs
 struct Constant <: Expression
@@ -80,6 +118,49 @@ function Base.convert(::Type{Expr}, op::Operation)
 end
 Base.show(io::IO, op::Operation) = print(io, convert(Expr, op))
 Base.hash(I::Operation, h::UInt) = foldr(hash, I.args, init = hash(I.func, h))
+
+
+variables(::Constant) = Variables[]
+variables(v::Variable) = Variables[v]
+variables(op::Operation) = sort!(collect(variables!(Set{Variable}(), op)))
+
+function variables!(vars::Set{Variable}, op::Operation)
+    variables!.(Ref(vars), op.args)
+    vars
+end
+variables!(vars::Set{Variable}, var::Variable) = (push!(vars, var); vars)
+variables!(vars::Set{Variable}, ::Constant) = vars
+
+subs(x::Constant, sub::Pair{Variable,<:Expression}) = x
+subs(x::Variable, sub::Pair{Variable,<:Expression}) = first(sub) == x ? last(sub) : x
+function subs(op::Operation, sub::Pair{Variable,<:Number})
+    subs(op, first(sub)=>Constant(last(sub)))
+end
+function subs(op::Operation, sub::Pair{Variable,<:Expression})
+    Operation(op.func, Expression[subs(arg, sub) for arg in op.args])
+end
+function subs(
+    expr::Expression,
+    sub_pairs::Union{
+        Pair{Variable,<:Union{Number, Expression}},
+        Pair{<:AbstractArray{Variable},<:AbstractArray{<:Union{Number, Expression}}},
+    }...,
+)
+    new_expr = expr
+    for sub in sub_pairs
+        new_expr = subs(new_expr, sub)
+    end
+    new_expr
+end
+function subs(
+    expr::Expression,
+    sub_pairs::Pair{<:AbstractArray{Variable},<:AbstractArray{<:Expression}},
+)
+    length(first(sub_pairs)) == length(last(sub_pairs)) || error(ArgumentError("Substitution arguments don't have the same length."))
+
+    list_of_pairs = map((k, v) -> k => v, first(sub_pairs), last(sub_pairs))
+    subs(expr, list_of_pairs...)
+end
 
 
 Base.broadcastable(v::Expression) = Ref(v)
@@ -341,6 +422,7 @@ using StaticArrays
 function evaluate end
 function evaluate! end
 function evaluate_gradient end
+function evaluate_jacobian! end
 
 function make_indexing(vars, params)
     lhs = convert.(Expr, vars)
@@ -355,7 +437,7 @@ end
 function compile(
     f::Operation,
     vars::AbstractVector{Variable},
-    params::Union{Nothing, AbstractVector{Variable}} = nothing;
+    params::Union{Nothing,AbstractVector{Variable}} = nothing,
 )
     name = Symbol(:CompiledOperation2__, hash(f))
     indexing = make_indexing(vars, params)
@@ -366,7 +448,7 @@ function compile(
         struct $name <: CompiledOperation
             op::Operation
             vars::Vector{Variable}
-            params::Union{Nothing, Vector{Variable}}
+            params::Union{Nothing,Vector{Variable}}
         end
 
         function evaluate(::$name, $(func_args...))
@@ -393,247 +475,102 @@ function compile(
         end
         $name
     end
-    compiled(f, Vector(vars), params === nothing ? nothing : Vector(params))
+    compiled(f, vars, params)
 end
 
-function compile_system(
+function compile(
     f::Vector{Operation},
     vars::Vector{Variable},
-    params::Union{Nothing, Vector{Variable}} = nothing;
+    params::Union{Nothing,Vector{Variable}} = nothing,
 )
-    name = Symbol(:CompiledOperationSystem5__, foldr(hash, f; init=UInt(0)))
+    name = Symbol(:CompiledOperationSystem_, foldr(hash, f; init = UInt(0)))
     indexing = make_indexing(vars, params)
     func_args = [:(x::AbstractVector)]
     params !== nothing && push!(func_args, :(p::AbstractVector))
-    assign_vec = gensym(:u)
+    u = gensym(:u)
+    U = gensym(:U)
 
     compiled = @eval begin
         struct $name <: CompiledOperationSystem
             op::Vector{Operation}
             vars::Vector{Variable}
-            params::Union{Nothing, Vector{Variable}}
+            params::Union{Nothing,Vector{Variable}}
         end
 
-        function evaluate(::$name, $(func_args...))
-            let $indexing
-                $(begin
-                    list = InstructionList()
-                    ids = [push!(list, fi) for fi in f]
-                    quote
-                        $(convert(Expr, list))
-                        @SVector $(Expr(:vect, convert.(Expr, ids)...))
-                    end
-                end)
-            end
-        end
-
-        function evaluate!($assign_vec::AbstractVector, ::$name, $(func_args...))
+        function evaluate!($u::AbstractVector, ::$name, $(func_args...))
             let $indexing
                 $(begin
                     list = InstructionList()
                     ids = [convert(Expr, push!(list, fi)) for fi in f]
                     quote
                         $(convert(Expr, list))
-                        $(map(i -> :($assign_vec[$i] = $(ids[i])), 1:length(ids))...)
-                        $assign_vec
+                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                        $u
                     end
                 end)
             end
         end
 
-        # function evaluate_gradient(::$name, $(func_args...))
-        #     let $indexing
-        #         $(begin
-        #             list = InstructionList()
-        #             f_x = convert(Expr, push!(list, f))
-        #             grad_x = let
-        #                 ids = [push!(list, differentiate(f, v)) for v in vars]
-        #                 :(@SVector $(Expr(:vect, convert.(Expr, ids)...)))
-        #             end
-        #             quote
-        #                 $(convert(Expr, list))
-        #                 $f_x, $grad_x
-        #             end
-        #         end)
-        #     end
-        # end
+        function evaluate(::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [convert(Expr, push!(list, fi)) for fi in f]
+                    quote
+                        $(convert(Expr, list))
+                        $(Expr(:vect, ids...))
+                    end
+                end)
+            end
+        end
+
+        function evaluate_jacobian!(
+            $u::Union{AbstractVector,Nothing},
+            $U::AbstractMatrix,
+            ::$name,
+            $(func_args...),
+        )
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    eval_ids = [convert(Expr, push!(list, fi)) for fi in f]
+                    jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
+                    quote
+                        $(convert(Expr, list))
+                        if !($u isa Nothing)
+                            $(map(i -> :($u[$i] = $(eval_ids[i])), 1:length(eval_ids))...)
+                        end
+                        $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
+                        nothing
+                    end
+                end)
+            end
+        end
+
+        function jacobian(::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
+                    quote
+                        $(convert(Expr, list))
+                        $(Expr(:vcat, map(1:length(f)) do i
+                            Expr(:row, jac_ids[i, :]...)
+                        end...))
+                    end
+                end)
+            end
+        end
+
         $name
     end
-     Base.invokelatest(compiled, f, vars, params)
+    Base.invokelatest(compiled, f, vars, params)
 end
 
-
-
-
-# const SimpleExpression = Union{InstructionId,Constant,Variable}
-#
-# struct Instruction
-#     func::Union{Nothing,Symbol} # module, function name
-#     args::Vector{SimpleExpression}
-# end
-#
-# Instruction(f::Union{Nothing,Symbol}, a::SimpleExpression) = Instruction(f, [a])
-# Instruction(x::SimpleExpression) = Instruction(nothing, x)
-#
-# Base.hash(I::Instruction, h::UInt) = foldr(hash, I.args, init = hash(I.func, h))
-# Base.:(==)(a::Instruction, b::Instruction) = a.func == b.func && a.args == b.args
-#
-# function Base.convert(::Type{Expr}, op::Instruction)
-#     if op.func === nothing && length(op.args) == 1
-#         convert(Expr, op.args[1])
-#     else
-#         Expr(:call, op.func, convert.(Expr, op.args)...)
-#     end
-# end
-# Base.show(io::IO, op::Instruction) = print(io, convert(Expr, op))
-#
-#
-# struct InstructionList
-#     instructions::OrderedDict{Instruction,InstructionId}
-#     derivatives::Dict{Tuple{InstructionId,Variable},Union{Constant,InstructionId}}
-#     var::Symbol
-#     n::Base.RefValue{Int}
-# end
-#
-#
-# function InstructionList(; var::Symbol = :ι, n::Base.RefValue{Int} = Ref(0))
-#     instructions = OrderedDict{Instruction,InstructionId}()
-#     derivatives = Dict{InstructionId,InstructionId}()
-#     InstructionList(instructions, derivatives, var, n)
-# end
-# function InstructionList(op::Expression; kwargs...)
-#     list = InstructionList(; kwargs...)
-#     push!(list, op)
-#     list
-# end
-#
-# function Base.push!(v::InstructionList, i::Instruction, id::InstructionId)
-#     if haskey(v.instructions, i)
-#         push!(v.instructions, Instruction(v.instructions[i]) => id)
-#     else
-#         push!(v.instructions, i => id)
-#     end
-# end
-#
-# function Base.push!(v::InstructionList, i::Instruction; id_var::Symbol = v.var)
-#     if haskey(v.instructions, i)
-#         v.instructions[i]
-#     else
-#         id = InstructionId(Symbol(id_var, v.n[] += 1))
-#         push!(v.instructions, i => id)
-#         id
-#     end
-# end
-#
-# Base.push!(list::InstructionList, x::SimpleExpression) = push!(list, Instruction(x))
-#
-# function Base.push!(list::InstructionList, op::Operation)
-#     push!(list, Instruction(op.func, map(arg -> _push!(list, arg), op.args)))
-# end
-# _push!(list::InstructionList, op::Operation) = push!(list, op)
-# _push!(list::InstructionList, op::Expression) = op
-#
-# Base.length(v::InstructionList) = length(v.instructions)
-# Base.iterate(v::InstructionList) = iterate(v.instructions)
-# Base.iterate(v::InstructionList, state) = iterate(v.instructions, state)
-# Base.eltype(v::Type{InstructionList}) = eltype(v.instructions)
-# # # Base.size(v::InstructionList) = (length(v),)
-# # # Base.getindex(v::InstructionList, i) = getindex(v.instructions, i)
-# # # Base.setindex!(v::InstructionList, instr::Instruction, i) =
-# # #     getindex(v.instructions, instr, i)
-# #
-# #
-# function Base.show(io::IO, ::MIME"text/plain", list::InstructionList)
-#     println(io, "InstructionList:")
-#     for (instr, id) in list
-#         println(io, convert(Expr, id), " = ", convert(Expr, instr))
-#     end
-# end
-#
-# function derivative(list::InstructionList, var::Variable)
-#     dlist = InstructionList(; var = Symbol(:∂, var.name))
-#     for (instr, id) in list.instructions
-#         push!(dlist, instr, id)
-#         derivative!(dlist, instr, id, var)
-#     end
-#     dlist
-# end
-#
-# function derivative(list::InstructionList, vars::Vector{Variable})
-#     dlist = InstructionList(; var = Symbol(:∂))
-#     N = length(list)
-#     i = 0
-#     derivs = []
-#     for (instr, id) in list.instructions
-#         i += 1
-#         push!(dlist, instr, id)
-#         for var in vars
-#             d_id = derivative!(dlist, instr, id, var)
-#             if i == N
-#                 push!(derivs, d_id)
-#             end
-#         end
-#     end
-#     dlist, derivs
-# end
-#
-# function derivative!(
-#     list::InstructionList,
-#     instr::Instruction,
-#     id::InstructionId,
-#     var::Variable,
-# )
-#     func = instr.func
-#
-#     # arity 1
-#     if length(instr.args) == 1
-#         u = instr.args[1]
-#         u′ = deriv_arg(u, list, var)
-#         if func == :-
-#             d = -u′
-#         elseif func === nothing
-#             d = u′
-#         else
-#             error("Unsupported arity 1 function; $func")
-#         end
-#     # arity 2
-#     elseif length(instr.args) == 2
-#         u, v = instr.args
-#         u′, v′ = deriv_arg(u, list, var), deriv_arg(v, list, var)
-#         # (a * b)' =  a'b + ab'
-#         if func === :*
-#             d = u * v′ + v * u′
-#         elseif func === :+
-#             d = u′ + v′
-#         elseif func === :-
-#             d = u′ - v′
-#         elseif func === :^
-#             # @assert v isa Constant
-#             d = v * u^(v - Constant(1)) * u′
-#         elseif func === :/
-#             d = u′ / v - (u * v′) / (v^2)
-#         end
-#     end
-#     s_d = simplify(d)
-#     d_id = push!(list, s_d)
-#     list.derivatives[(id, var)] = s_d isa Constant ? s_d : d_id
-#     d_id
-# end
-#
-#
-# deriv_arg(arg::InstructionId, list::InstructionList, var::Variable) =
-#     list.derivatives[(arg, var)]
-# function deriv_arg(arg::Variable, list::InstructionList, var::Variable)
-#     arg == var ? Constant(1) : Constant(0)
-# end
-# deriv_arg(arg::Constant, list::InstructionList, var) = Constant(0)
-#
-#
-
-
-# function derivative(op::Operation, args::NTuple{N,Variable}, i::Int = 1) where N
-#     convert(Expression, diffrule_derivative(op.func..., name.(args), i))
-# end
+Base.size(F::CompiledOperationSystem) = (length(F.op), length(F.vars))
+function jacobian!(U::AbstractMatrix, S::CompiledOperationSystem, args...)
+    jacobian!(nothing, U, S, args...)
+end
 
 
 end # module

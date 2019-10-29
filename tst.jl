@@ -4,21 +4,57 @@ Pkg.activate(@__DIR__)
 using HCModelKit, BenchmarkTools
 
 
-x = Variable(:x)
-y = Variable(:y)
-z = Variable(:z)
+@var a b c[1:20]
 
-f = ((2x+3y-3)^2 + 7
-g = (x - y^2+3)^2 + 3x*y
-function my_compile(F, vars)
-    HCModelKit.compile_system(F, vars)
-end
+(a + b)^32
 
-sys = my_compile([f, g], [x, y])
-evaluate(sys, [3.123, 0.412212])
-u = zeros(2)
+@var x y z
+
+f = (2x+3y-3)^2 + 7z+3
+g = (x - y^2+3)^2 + 3x*y+z^2
+
+
+
+
+@var a b
+
+subs(f, x => a^4, y => a)
+subs(f,  z => 3)
+subs(f, [x, y] => [a, b])
+subs(f, [x, y] => [a, b], z => 2)
+
+sub_pairs = [x, y] => [a, b]
+
+map((k,v) -> k => v, first(sub_pairs), last(sub_pairs))
+
+
+sys = compile([f, g], [x, y, z])
+evaluate(sys, [2, 32, 1])
+HCModelKit.jacobian(sys, [2, 32, 1])
+
+
+evaluate(sys, [3.123, 0.412212, 3.12])
+u = zeros(ComplexF64, 2)
+U = zeros(ComplexF64, 2, 3)
+v = randn(ComplexF64, 3)
+@btime HCModelKit.evaluate_and_jacobian!($u, $U, $sys, $v)
+@btime HCModelKit.evaluate!($u, $sys, $v)
+
+HCModelKit.evaluate_jacobian!(nothing, U, sys, v)
+HCModelKit.evaluate_and_jacobian!($u, $U, $sys, $v)
+
+u
+U
+
 v = rand(2)
 @btime evaluate!($u, $sys, $v)
+
+
+
+
+
+
+
 
 
 evaluate_gradient(sys, [3.123, 0.412212])
