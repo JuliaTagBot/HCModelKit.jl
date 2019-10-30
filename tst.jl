@@ -3,15 +3,121 @@ Pkg.activate(@__DIR__)
 
 using HCModelKit, BenchmarkTools
 
+@var x[1:3]
 
-@var a b c[1:20]
+exps = HCModelKit.monomials(x, 4; homogenous=true)
 
+
+_exp = exps[1]
+i = 1
+prod(i -> x[i]^(_exp[i]), 1:n)
+
+prod(i -> x[i]^4, 1:3)
+
+pred = x -> sum(x) ≤ d
+d = 2
+n = 3
+
+collect(Iterators.filter(pred, Iterators.product(Iterators.repeated(0:d, n)...)))
+@macroexpand (@unique_var a[1:2])
+
+
+@macroexpand (@var a[1:2])
+a
 (a + b)^32
 
 @var x y z
 
 f = (2x+3y-3)^2 + 7z+3
 g = (x - y^2+3)^2 + 3x*y+z^2
+
+det([f g; g f])
+
+
+@var x y z
+f = [(0.3 * x^2 + 0.5z + 0.3x + 1.2 * y^2 - 1.1)^2 +
+    (0.7 * (y - 0.5x)^2 + y + 1.2 * z^2 - 1)^2 - 0.3]
+
+
+I = let
+    x = variables(f)
+    n, m = length(x), length(f)
+    @unique_var y[1:n] v[1:m] w[1:m]
+    J = [differentiate(fᵢ, xᵢ) for fᵢ in f, xᵢ in x]
+    f′ = [subs(fᵢ, x => y) for fᵢ in f]
+    J′ = [subs(gᵢ, x => y) for gᵢ in J]
+    Nx = (x - y) - J' * v
+    Ny = (x - y) - J′' * w
+    compile([f; f′; Nx; Ny], [x;y;v;w])
+end
+
+
+@var x[1:2] a[1:5] c[1:6] y[1:2, 1:5]
+
+#tangential conics
+f = a[1]*x[1]^2 + a[2]*x[1]*x[2] + a[3]*x[2]^2 + a[4]*x[1]  + a[5]*x[2] + 1;
+∇ = differentiate(f, x)
+#5 conics
+g = c[1]*x[1]^2 + c[2]*x[1]*x[2] + c[3]*x[2]^2 + c[4]*x[1]  + c[5]*x[2] + c[6];
+∇_2 = differentiate(g, x)
+#the general system
+#f_a_0 is tangent to g_b₀ at x₀
+function Incidence(f,a₀,g,b₀,x₀)
+    fᵢ = f(x=>x₀, a=>a₀)
+    ∇ᵢ = [∇ᵢ(x=>x₀, a=>a₀) for ∇ᵢ in ∇]
+    Cᵢ = g(x=>x₀, c=>b₀)
+    ∇_Cᵢ = [∇ⱼ(x=>x₀, c=>b₀) for ∇ⱼ in ∇_2]
+
+    [fᵢ; Cᵢ;  det([∇ᵢ ∇_Cᵢ])]
+end
+@var v[1:6, 1:5]
+F = vcat(map(i -> Incidence(f,a,g, v[:,i], y[:,i]), 1:5)...)
+variables(F)
+
+CF = compile(F, [a;vec(y)], vec(v))
+
+
+
+x = randn(ComplexF64, 8)
+
+u = zeros(ComplexF64, 8)
+U = zeros(ComplexF64, 8, 8)
+evaluate(I, x)
+jacobian(I, x)
+
+
+@btime evaluate_jacobian!($u, $U, $I, $x)
+@btime evaluate!($u, $I, $x)
+@btime jacobian!($U, $I, $x)
+
+# reach
+using LinearAlgebra
+@var x y
+f = (x^3 - x*y^2 + y + 1)^2 * (x^2 + y^2 - 1) + y^2 - 5
+∇ = differentiate(f, [x;y]) # the gradient
+H = differentiate(∇, [x;y]) # the Hessian
+
+g = ∇ ⋅ ∇
+v = [-∇[2]; ∇[1]]
+h = v' * H * v
+dg = differentiate(g, [x;y])
+dh = differentiate(h, [x;y])
+
+∇σ = g .* dh - ((3/2) * h).* dg
+
+F = [v ⋅ ∇σ; f]
+
+CF = compile(F, [x,y])
+x = randn(ComplexF64, 2)
+u = randn(ComplexF64, 2)
+U = randn(ComplexF64, 2, 2)
+@btime evaluate!($u, $CF, $x)
+@btime evaluate_jacobian!($u, $U, $CF, $x)
+
+
+
+
+
 
 
 
