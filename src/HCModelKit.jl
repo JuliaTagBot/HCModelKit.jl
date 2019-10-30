@@ -1,34 +1,42 @@
 module HCModelKit
 
 using OrderedCollections: OrderedDict
+using StaticArrays: @SVector
 
 import LinearAlgebra: det, dot
 
-export Expression, Constant, Variable, Operation, Instruction, InstructionList
+export Expression, Constant, Variable, Operation
 
-export differentiate,
+export @var,
+       @unique_var,
+       evaluate,
+       subs,
+       variables,
+       differentiate,
+       monomials,
+       CompiledOperation,
+       CompiledOperationSystem,
+       CompiledOperationHomotopy
        compile,
        evaluate,
        evaluate!,
        evaluate_gradient,
+       evaluate_jacobian!,
        jacobian,
        jacobian!,
-       evaluate_jacobian!,
-       @var,
-       @unique_var,
-       subs,
-       variables,
-       det,
-       monomials
 
 abstract type Expression end
 
-Base.iszero(::Expression) = false
-Base.isone(::Expression) = false
-Base.one(::Expression) = Constant(1)
-Base.zero(::Expression) = Constant(0)
-Base.adjoint(expr::Expression) = expr
 
+###############
+## VARIABLES ##
+###############
+
+struct Variable <: Expression
+    name::Symbol
+end
+Variable(name, indices...) = Variable("$(name)$(join(map_subscripts.(indices), "₋"))")
+Variable(s::AbstractString) = Variable(Symbol(s))
 
 const INDEX_MAP = Dict{Char,Char}(
     '0' => '₀',
@@ -44,13 +52,6 @@ const INDEX_MAP = Dict{Char,Char}(
 )
 map_subscripts(indices) = join(INDEX_MAP[c] for c in string(indices))
 
-# VARIABLE
-struct Variable <: Expression
-    name::Symbol
-end
-Variable(name, indices...) = Variable("$(name)$(join(map_subscripts.(indices), "₋"))")
-Variable(s::AbstractString) = Variable(Symbol(s))
-
 name(v::Variable) = v.name
 
 Base.isless(u::Variable, v::Variable) = isless(u.name, v.name)
@@ -62,13 +63,62 @@ Base.iterate(expr::Expression) = expr, 1
 Base.iterate(expr::Expression, state) = nothing
 dot(x::Expression, y::Expression) = x * y
 
-macro unique_var(args...)
-    vars, exprs = buildvars(args; unique = true)
+## variable macros
+
+"""
+    @var(args...)
+
+Declare variables with the given and automatically create the variable bindings.
+
+## Examples
+
+```julia
+julia> @var a b x[1:2] y[1:2,1:3]
+(a, b, Variable[x₁, x₂], Variable[y₁₋₁ y₁₋₂ y₁₋₃; y₂₋₁ y₂₋₂ y₂₋₃])
+
+julia> a
+a
+
+julia> b
+b
+
+julia> x
+2-element Array{Variable,1}:
+ x₁
+ x₂
+
+julia> y
+2×3 Array{Variable,2}:
+ y₁₋₁  y₁₋₂  y₁₋₃
+ y₂₋₁  y₂₋₂  y₂₋₃
+```
+"""
+macro var(args...)
+    vars, exprs = buildvars(args; unique = false)
     :($(foldl((x, y) -> :($x; $y), exprs, init = :())); $(Expr(:tuple, esc.(vars)...)))
 end
 
-macro var(args...)
-    vars, exprs = buildvars(args; unique = false)
+"""
+    @unique_var(args...)
+
+Declare variables and automatically create the variable bindings to the given names.
+This will change the names of the variables to ensure uniqueness.
+
+## Examples
+
+```julia
+julia> @unique_var a b
+(##a#591, ##b#592)
+
+julia> a
+##a#591
+
+julia> b
+##b#592
+```
+"""
+macro unique_var(args...)
+    vars, exprs = buildvars(args; unique = true)
     :($(foldl((x, y) -> :($x; $y), exprs, init = :())); $(Expr(:tuple, esc.(vars)...)))
 end
 
@@ -147,11 +197,42 @@ Base.show(io::IO, op::Operation) = print(io, convert(Expr, op))
 Base.hash(I::Operation, h::UInt) = foldr(hash, I.args, init = hash(I.func, h))
 Base.convert(::Type{Operation}, c::Constant) = Operation(:identity, c)
 
+################
+## Expression ##
+################
+
+for (f, arity) in [(:+, 2), (:-, 1), (:-, 2), (:*, 2), (:/, 2), (:^, 2)]
+    if arity == 1
+        @eval Base.$f(a::Expression) = Operation($(QuoteNode(f)), a)
+    elseif arity == 2
+        @eval Base.$f(a::Expression, b::Expression) = Operation($(QuoteNode(f)), a, b)
+        @eval Base.$f(a::Expression, b::Number) = Operation($(QuoteNode(f)), a, Constant(b))
+        @eval Base.$f(a::Number, b::Expression) = Operation($(QuoteNode(f)), Constant(a), b)
+    end
+end
+Base.:(+)(a::Expression) = a
+
+Base.iszero(::Expression) = false
+Base.zero(::Expression) = Constant(0)
+Base.isone(::Expression) = false
+Base.one(::Expression) = Constant(1)
+Base.adjoint(expr::Expression) = expr
+Base.transpose(expr::Expression) = expr
+Base.broadcastable(v::Expression) = Ref(v)
+function Base.convert(::Type{Expression}, ex::Expr)
+    ex.head === :call || throw(ArgumentError("internal representation does not support non-call Expr"))
+    return Operation(ex.args[1], convert.(Expression, ex.args[2:end])...)
+end
 Base.promote_rule(::Type{<:Expression}, ::Type{<:Number}) = Expression
 Base.promote_rule(::Type{<:Expression}, ::Type{Symbol}) = Expression
+Base.promote_rule(::Type{<:Expression}, ::Type{Operation}) = Expression
 
-# variables(::Constant) = Variables[]
-# variables(v::Variable) = Variables[v]
+"""
+    variables(expr::Expression)
+    variables(exprs::AbstractVector{<:Expression})
+
+Obtain all variables used in the given expression.
+"""
 variables(op::Expression) = sort!(collect(variables!(Set{Variable}(), op)))
 function variables(exprs::AbstractVector{<:Expression})
     S = Set{Variable}()
@@ -168,6 +249,24 @@ end
 variables!(vars::Set{Variable}, var::Variable) = (push!(vars, var); vars)
 variables!(vars::Set{Variable}, ::Constant) = vars
 
+"""
+    subs(expr::Expression, subs::Pair{Variable,<:Expression}...)
+    subs(expr::Expression, subs::Pair{AbstractArray{<:Variable},AbstractArray{<:Expression}}...)
+
+Substitute into the given expression.
+
+## Example
+
+```
+@var x y z
+
+julia> subs(x^2, x => y)
+y ^ 2
+
+julia> subs(x * y, [x,y] => [x+2,y+2])
+(x + 2) * (y + 2)
+```
+"""
 subs(x::Constant, sub::Pair{Variable,<:Expression}) = x
 subs(x::Variable, sub::Pair{Variable,<:Expression}) = first(sub) == x ? last(sub) : x
 function subs(op::Operation, sub::Pair{Variable,<:Number})
@@ -202,11 +301,89 @@ function subs(
     subs(expr, list_of_pairs...)
 end
 
-(op::Union{Variable,Operation})(sub_pairs::Union{
-    Pair{Variable,<:Union{Number,Expression}},
-    Pair{<:AbstractArray{Variable},<:AbstractArray{<:Union{Number,Expression}}},
-}...) = subs(op, sub_pairs...)
+"""
+    evaluate(expr::Expression, subs::Pair{Variable,<:Any}...)
+    evaluate(expr::Expression, subs::Pair{AbstractArray{<:Variable},AbstractArray{<:Any}}...)
 
+Evaluate the given expression.
+
+## Example
+
+```
+@var x y
+
+julia> evaluate(x^2, x => 2)
+4
+
+julia> evaluate(x * y, [x,y] => [2, 3])
+6
+"""
+function evaluate(
+    expr::Union{Expression,AbstractArray{<:Expression}},
+    args::Pair{<:AbstractArray{<:Variable,N},<:AbstractArray{<:Any,N}}...,
+) where {N}
+    D = Dict{Variable,Any}()
+    for arg in args
+        for (k, v) in zip(arg...)
+            D[k] = v
+        end
+    end
+    if expr isa AbstractArray
+        map(e -> evaluate(e, D), expr)
+    else
+        evaluate(expr, D)
+    end
+end
+function evaluate(
+    expr::Union{Expression,AbstractArray{<:Expression}},
+    args::Pair{<:AbstractArray{<:Variable,N},<:AbstractArray{T,N}}...,
+) where {T,N}
+    D = Dict{Variable,T}()
+    for arg in args
+        for (k, v) in zip(arg...)
+            D[k] = v
+        end
+    end
+    if expr isa AbstractArray
+        map(e -> evaluate(e, D), expr)
+    else
+        evaluate(expr, D)
+    end
+end
+evaluate(op::Constant, args::Dict{Variable,<:Any}) = op.value
+evaluate(op::Variable, args::Dict{Variable,<:Any}) = args[op]
+function evaluate(op::Operation, args::Dict{Variable,<:Any})
+    if length(op.args) == 2
+        a, b = evaluate(op.args[1], args), evaluate(op.args[2], args)
+
+        if op.func == :+
+            a + b
+        elseif op.func == :-
+            a - b
+        elseif op.func == :/
+            a / b
+        elseif op.func == :^
+            a^b
+        elseif op.func == :*
+            a * b
+        else
+            error("Unsupported func: " * string(op.func))
+        end
+    elseif length(op.args) == 1
+        a = evaluate(op.args[1], args)
+        if op.func == :identity
+            a
+        elseif op.func == :-
+            -a
+        else
+            error("Unsupported func: " * string(op.func))
+        end
+    else
+        error("Unsupported argument length")
+    end
+end
+
+(op::Union{Constant,Variable,Operation})(args...) = evaluate(op, args...)
 
 function det(A::AbstractMatrix{<:Expression})
     isequal(size(A)...) || throw(ArgumentError("Cannot compute `det` of a non-square matrix."))
@@ -220,25 +397,17 @@ function det(A::AbstractMatrix{<:Expression})
     A[1, 2] * (A[2, 1] * A[3, 3] - A[2, 3] * A[3, 1]) +
     A[1, 3] * (A[2, 1] * A[3, 2] - A[2, 2] * A[3, 1])
 end
-Base.broadcastable(v::Expression) = Ref(v)
 
+"""
+    simplify(expr::Expression)
 
-function Base.convert(::Type{Expression}, ex::Expr)
-    ex.head === :call || throw(ArgumentError("internal representation does not support non-call Expr"))
-    return Operation(ex.args[1], convert.(Expression, ex.args[2:end])...)
-end
+Try to simplify the given expression.
 
-for (f, arity) in [(:+, 2), (:-, 1), (:-, 2), (:*, 2), (:/, 2), (:^, 2)]
-    if arity == 1
-        @eval Base.$f(a::Expression) = Operation($(QuoteNode(f)), a)
-    elseif arity == 2
-        @eval Base.$f(a::Expression, b::Expression) = Operation($(QuoteNode(f)), a, b)
-        @eval Base.$f(a::Expression, b::Number) = Operation($(QuoteNode(f)), a, Constant(b))
-        @eval Base.$f(a::Number, b::Expression) = Operation($(QuoteNode(f)), Constant(a), b)
-    end
-end
-Base.:(+)(a::Expression) = a
-
+```julia
+julia> @var x;
+julia> simplify(x + 0)
+x
+"""
 simplify(expr::Expression) = expr
 function simplify(op::Operation)
     if op.args[1] isa Operation
@@ -324,7 +493,13 @@ function simplify(op::Operation)
     Operation(op.func, u, v)
 end
 
+"""
+    differentiate(expr::Expression, var::Variable)
+    differentiate(expr::Expression, var::Vector{Variable})
+    differentiate(expr::Vector{<:Expression}, var::Vector{Variable})
 
+Compute the derivative of `expr` with respect to the given variable `var`.
+"""
 function differentiate(op::Operation, var::Variable)
     func, args = op.func, op.args
 
@@ -368,6 +543,31 @@ function differentiate(exprs::AbstractVector{<:Expression}, vars::AbstractVector
     [differentiate(expr, v) for expr in exprs, v in vars]
 end
 
+"""
+    monomials(vars, d; homogeneous::Bool = false)
+
+Create all monomials of a given degree.
+
+```
+julia> @var x y
+(x, y)
+
+julia> monomials([x,y], 2)
+6-element Array{Expression,1}:
+ x ^ 2
+ x * y
+ y ^ 2
+ x
+ y
+ 1
+
+julia> monomials([x,y], 2; homogeneous = true)
+3-element Array{Operation,1}:
+ x ^ 2
+ x * y
+ y ^ 2
+ ```
+"""
 function monomials(vars::AbstractVector{Variable}, d::Integer; homogeneous::Bool = false)
     n = length(vars)
     if homogeneous
@@ -388,8 +588,11 @@ function td_order(x, y)
 end
 
 
-#
-# Instruction Id
+###########################
+## CODEGEN + COMPILATION ##
+###########################
+
+
 struct InstructionId
     name::Symbol
 end
@@ -503,25 +706,55 @@ end
 
 
 ## CODEGEN
+function evaluate end
+function evaluate! end
+function evaluate_gradient end
+function evalute_jacobian end
+function evaluate_jacobian! end
+function jacobian end
+function jacobian! end
+function dt! end
+function dt end
+function jacobian_dt! end
+
 
 abstract type CompiledOperation end
 abstract type CompiledOperationSystem end
 
-using StaticArrays
+Base.length(F::CompiledOperationSystem) = size(F, 1)
+Base.size(F::CompiledOperationSystem) = (length(F.op), length(F.vars))
+Base.size(F::CompiledOperationSystem, i::Integer) = size(F)[i]
+function jacobian!(U::AbstractMatrix, S::CompiledOperationSystem, args...)
+    evaluate_jacobian!(nothing, U, S, args...)
+    U
+end
+function evaluate_jacobian(S::CompiledOperationSystem, args...)
+    evaluate(S, args...), jacobian(S, args...)
+end
 
-function evaluate end
-function evaluate! end
-function evaluate_gradient end
-function evaluate_jacobian! end
+
+
+
+
 
 function make_indexing(vars, params)
-    lhs = convert.(Expr, vars)
-    rhs = Expr[:(x[$i]) for i = 1:length(vars)]
+    lhs = Any[convert(Expr, v) for v in vars]
+    rhs = Any[:(x[$i]) for i = 1:length(vars)]
     if params !== nothing
-        append!(lhs, convert.(Expr, vars))
-        append!(rhs, convert.(Expr, params))
+        append!(lhs, convert.(Expr, params))
+        for i = 1:length(params)
+            push!(rhs, :(p[$i]))
+        end
     end
     :($(Expr(:tuple, lhs...)) = $(Expr(:tuple, rhs...)))
+end
+
+function check_vars_params(f, vars, params)
+    vars_params = params === nothing ? vars : [vars; params]
+    Δ = setdiff(variables(f), vars_params)
+    isempty(Δ) || throw(ArgumentError("Not all variables or parameters of the system are given. Missing: " *
+                                      join(Δ, ", ")))
+    nothing
 end
 
 function compile(
@@ -530,7 +763,9 @@ function compile(
     params::Union{Nothing,AbstractVector{Variable}} = nothing,
 )
     f = simplify(f)
-    name = Symbol(:CompiledOperation2__, hash(f))
+    check_vars_params(f, vars, params)
+
+    name = Symbol("CompiledOperation##", hash(f))
     indexing = make_indexing(vars, params)
     func_args = [:(x::AbstractVector)]
     params !== nothing && push!(func_args, :(p::AbstractVector))
@@ -575,10 +810,13 @@ function compile(
     params::Union{Nothing,Vector{Variable}} = nothing,
 )
     f = simplify.(f)
-    name = Symbol(:CompiledOperationSystem_, foldr(hash, f; init = UInt(0)))
+    check_vars_params(f, vars, params)
+
+    name = Symbol("CompiledOperationSystem##", foldr(hash, f; init = UInt(0)))
     indexing = make_indexing(vars, params)
     func_args = [:(x::AbstractVector)]
     params !== nothing && push!(func_args, :(p::AbstractVector))
+
     u = gensym(:u)
     U = gensym(:U)
 
@@ -659,10 +897,164 @@ function compile(
     Base.invokelatest(compiled, f, vars, params)
 end
 
-Base.size(F::CompiledOperationSystem) = (length(F.op), length(F.vars))
-function jacobian!(U::AbstractMatrix, S::CompiledOperationSystem, args...)
+
+# Homotopies
+abstract type CompiledOperationHomotopy end
+
+Base.length(F::CompiledOperationHomotopy) = size(F, 1)
+Base.size(F::CompiledOperationHomotopy) = (length(F.op), length(F.vars))
+Base.size(F::CompiledOperationHomotopy, i::Integer) = size(F)[i]
+function jacobian!(U::AbstractMatrix, S::CompiledOperationHomotopy, args...)
     evaluate_jacobian!(nothing, U, S, args...)
     U
+end
+function evaluate_jacobian(S::CompiledOperationHomotopy, args...)
+    evaluate(S, args...), jacobian(S, args...)
+end
+
+function compile(
+    f::Vector{Operation},
+    vars::Vector{Variable},
+    homotopy_var::Variable,
+    params::Union{Nothing,Vector{Variable}} = nothing,
+)
+    f = simplify.(f)
+    check_vars_params(f, [vars; homotopy_var], params)
+
+    name = Symbol("CompiledOperationHomotopy##", foldr(hash, f; init = UInt(0)))
+    indexing = make_indexing(vars, params)
+    @show indexing
+    func_args = [:(x::AbstractVector), :($(convert(Expr, homotopy_var))::Number)]
+    params !== nothing && push!(func_args, :(p::AbstractVector))
+
+    u = gensym(:u)
+    U = gensym(:U)
+
+    compiled = @eval begin
+        struct $name <: CompiledOperationHomotopy
+            op::Vector{Operation}
+            vars::Vector{Variable}
+            homotopy_var::Variable
+            params::Union{Nothing,Vector{Variable}}
+        end
+
+        function evaluate!($u::AbstractVector, ::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [convert(Expr, push!(list, fi)) for fi in f]
+                    quote
+                        $(convert(Expr, list))
+                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                        $u
+                    end
+                end)
+            end
+        end
+
+        function evaluate(::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [convert(Expr, push!(list, fi)) for fi in f]
+                    quote
+                        $(convert(Expr, list))
+                        $(Expr(:vect, ids...))
+                    end
+                end)
+            end
+        end
+
+        function evaluate_jacobian!(
+            $u::Union{AbstractVector,Nothing},
+            $U::AbstractMatrix,
+            ::$name,
+            $(func_args...),
+        )
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    eval_ids = [convert(Expr, push!(list, fi)) for fi in f]
+                    jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
+                    quote
+                        $(convert(Expr, list))
+                        if !($u isa Nothing)
+                            $(map(i -> :($u[$i] = $(eval_ids[i])), 1:length(eval_ids))...)
+                        end
+                        $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
+                        nothing
+                    end
+                end)
+            end
+        end
+
+        function jacobian(::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
+                    quote
+                        $(convert(Expr, list))
+                        $(Expr(:vcat, map(1:length(f)) do i
+                            Expr(:row, jac_ids[i, :]...)
+                        end...))
+                    end
+                end)
+            end
+        end
+
+        function dt!($u::AbstractVector, ::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [convert(Expr, push!(list, differentiate(fi, homotopy_var))) for fi in f]
+                    quote
+                        $(convert(Expr, list))
+                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                        $u
+                    end
+                end)
+            end
+        end
+
+        function dt(::$name, $(func_args...))
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [push!(list, differentiate(fi, homotopy_var)) for fi in f]
+                    quote
+                        $(convert(Expr, list))
+                        $(Expr(:vect, convert.(Expr, ids)...))
+                    end
+                end)
+            end
+        end
+
+        function jacobian_dt!(
+            $U::AbstractMatrix,
+            $u::AbstractVector,
+            ::$name,
+            $(func_args...),
+        )
+            let $indexing
+                $(begin
+                    list = InstructionList()
+                    ids = [convert(Expr, push!(list, differentiate(fi, homotopy_var))) for fi in f]
+                    jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
+                    quote
+                        $(convert(Expr, list))
+                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                        $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
+                        nothing
+                    end
+                end)
+            end
+        end
+
+        $name
+    end
+
+    Base.invokelatest(compiled, f, vars, homotopy_var, params)
 end
 
 
