@@ -4,6 +4,7 @@ using OrderedCollections: OrderedDict
 using StaticArrays: @SVector
 
 import LinearAlgebra: det, dot
+import Latexify
 
 export Expression, Constant, Variable, Operation
 

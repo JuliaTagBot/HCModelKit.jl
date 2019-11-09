@@ -32,9 +32,6 @@ Base.:(==)(x::Variable, y::Variable) = x.name == y.name
 Base.show(io::IO, v::Variable) = print(io, v.name)
 Base.convert(::Type{Expr}, x::Variable) = x.name
 Base.convert(::Type{Expression}, x::Symbol) = Variable(x)
-Base.iterate(expr::Expression) = expr, 1
-Base.iterate(expr::Expression, state) = nothing
-dot(x::Expression, y::Expression) = x * y
 
 ## variable macros
 
@@ -155,20 +152,48 @@ struct Operation <: Expression
 end
 @noinline _err_unsupported_func(func) =
     throw(ArgumentError("Function `$func` not supported."))
-@noinline _err_wrong_nargs(n) =
-    throw(ArgumentError("Operation can only hold 1 or 2 arguments, but $n provided."))
+# @noinline _err_wrong_nargs(n) =
+#     throw(ArgumentError("Operation can only hold 1 or 2 arguments, but $n provided."))
 
 
 Operation(func::Symbol, arg::Expression) = Operation(func, Expression[arg])
 Operation(func::Symbol, a::Expression, b::Expression) = Operation(func, Expression[a, b])
 
 Base.:(==)(x::Operation, y::Operation) = (x.func === y.func) && (x.args == y.args)
-function Base.convert(::Type{Expr}, op::Operation)
-    Expr(:call, op.func, convert.(Expr, op.args)...)
-end
-Base.show(io::IO, op::Operation) = print(io, convert(Expr, op))
 Base.hash(I::Operation, h::UInt) = foldr(hash, I.args, init = hash(I.func, h))
 Base.convert(::Type{Operation}, c::Constant) = Operation(:identity, c)
+Base.convert(::Type{Expr}, op::Operation) = Expr(:call, op.func, convert.(Expr, op.args)...)
+
+Base.show(io::IO, op::Operation) = print(io, flattened_expr(op))
+flattened_expr(expr::Expression) = convert(Expr, expr)
+function flattened_expr(O::Operation)
+    # Tree shrinking
+    if O.func == :+ || O.func == :*
+       # Flatten tree
+        args = []
+        for arg in O.args
+            fexpr = flattened_expr(arg)
+            if arg isa Operation && arg.func === O.func
+                for i = 2:length(fexpr.args)
+                    push!(args, fexpr.args[i])
+                end
+            else
+                push!(args, fexpr)
+            end
+        end
+        return Expr(:call, O.func, args...)
+    end
+    Expr(:call, O.func, flattened_expr.(O.args)...)
+end
+
+Latexify.@latexrecipe function f(exprs::AbstractVector{<:Expression})
+    # Set default option values.
+    return flattened_expr.(exprs)
+end
+Latexify.@latexrecipe function f(expr::Expression)
+    return flattened_expr(expr)
+end
+
 
 ################
 ## Expression ##
@@ -179,11 +204,18 @@ for (f, arity) in [(:+, 2), (:-, 1), (:-, 2), (:*, 2), (:/, 2), (:^, 2)]
         @eval Base.$f(a::Expression) = Operation($(QuoteNode(f)), a)
     elseif arity == 2
         @eval Base.$f(a::Expression, b::Expression) = Operation($(QuoteNode(f)), a, b)
-        @eval Base.$f(a::Expression, b::Number) = Operation($(QuoteNode(f)), a, Constant(b))
-        @eval Base.$f(a::Number, b::Expression) = Operation($(QuoteNode(f)), Constant(a), b)
+        @eval Base.$f(a::Expression, b::Number) = Base.$f(a, Constant(b))
+        @eval Base.$f(a::Number, b::Expression) = Base.$f(Constant(a), b)
     end
 end
 Base.:(+)(a::Expression) = a
+# Make + 0 or * 1 no-ops
+Base.:(+)(a::Constant, b::Constant) = iszero(a) ? b : (iszero(b) ? a : Operation(:+, a, b))
+Base.:(+)(a::Expression, b::Constant) = iszero(b) ? a : Operation(:+, a, b)
+Base.:(+)(a::Constant, b::Expression) = iszero(a) ? b : Operation(:+, a, b)
+Base.:(*)(a::Constant, b::Constant) = isone(a) ? b : (isone(b) ? a : Operation(:*, a, b))
+Base.:(*)(a::Expression, b::Constant) = isone(b) ? a : Operation(:*, a, b)
+Base.:(*)(a::Constant, b::Expression) = isone(a) ? b : Operation(:*, a, b)
 
 Base.iszero(::Expression) = false
 Base.zero(::Expression) = Constant(0)
@@ -192,6 +224,10 @@ Base.one(::Expression) = Constant(1)
 Base.adjoint(expr::Expression) = expr
 Base.transpose(expr::Expression) = expr
 Base.broadcastable(v::Expression) = Ref(v)
+Base.iterate(expr::Expression) = expr, 1
+Base.iterate(expr::Expression, state) = nothing
+dot(x::Expression, y::Expression) = x * y
+
 function Base.convert(::Type{Expression}, ex::Expr)
     ex.head === :call || throw(ArgumentError("internal representation does not support non-call Expr"))
     return Operation(ex.args[1], convert.(Expression, ex.args[2:end])...)
@@ -199,7 +235,6 @@ end
 Base.promote_rule(::Type{<:Expression}, ::Type{<:Number}) = Expression
 Base.promote_rule(::Type{<:Expression}, ::Type{Symbol}) = Expression
 Base.promote_rule(::Type{<:Expression}, ::Type{Operation}) = Expression
-
 """
     variables(expr::Expression)
     variables(exprs::AbstractVector{<:Expression})
