@@ -1,7 +1,7 @@
 module HCModelKit
 
 using OrderedCollections: OrderedDict
-using StaticArrays: @SVector
+using StaticArrays: @SVector, @SMatrix
 
 import LinearAlgebra: det, dot
 import Latexify
@@ -26,7 +26,7 @@ export @var,
        jacobian,
        jacobian!
 
- include("expression.jl")
+include("expression.jl")
 include("codegen.jl")
 
 end # module

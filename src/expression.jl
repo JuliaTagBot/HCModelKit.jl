@@ -146,14 +146,14 @@ struct Operation <: Expression
 
     function Operation(func::Symbol, args::Vector{Expression})
         func ∈ SUPPORTED_FUNCTIONS || _err_unsupported_func(func)
-        1 ≤ length(args) ≤ 2 || _err_wrong_nargs(n)
+        1 ≤ length(args) ≤ 2 || _err_wrong_nargs(length(args))
         new(func, args)
     end
 end
 @noinline _err_unsupported_func(func) =
     throw(ArgumentError("Function `$func` not supported."))
-# @noinline _err_wrong_nargs(n) =
-#     throw(ArgumentError("Operation can only hold 1 or 2 arguments, but $n provided."))
+@noinline _err_wrong_nargs(n) =
+    throw(ArgumentError("Operation can only hold 1 or 2 arguments, but $n provided."))
 
 
 Operation(func::Symbol, arg::Expression) = Operation(func, Expression[arg])
@@ -232,6 +232,7 @@ function Base.convert(::Type{Expression}, ex::Expr)
     ex.head === :call || throw(ArgumentError("internal representation does not support non-call Expr"))
     return Operation(ex.args[1], convert.(Expression, ex.args[2:end])...)
 end
+Expression(x) = convert(Expression, x)
 Base.promote_rule(::Type{<:Expression}, ::Type{<:Number}) = Expression
 Base.promote_rule(::Type{<:Expression}, ::Type{Symbol}) = Expression
 Base.promote_rule(::Type{<:Expression}, ::Type{Operation}) = Expression
@@ -594,3 +595,51 @@ function td_order(x, y)
     sy = sum(y)
     sx == sy ? x < y : sx < sy
 end
+
+
+struct System
+    expressions::Vector{Expression}
+    variables::Vector{Variable}
+    parameters::Vector{Variable}
+
+    function System(
+        exprs::Vector{Expression},
+        vars::Vector{Variable},
+        params::Vector{Variable},
+    )
+        check_vars_params(exprs, vars, params)
+        new(exprs, vars, params)
+    end
+end
+
+function check_vars_params(f, vars, params)
+    vars_params = params === nothing ? vars : [vars; params]
+    Δ = setdiff(variables(f), vars_params)
+    isempty(Δ) || throw(ArgumentError("Not all variables or parameters of the system are given. Missing: " *
+                                      join(Δ, ", ")))
+    nothing
+end
+
+function System(
+    exprs::Vector{<:Expression},
+    variables::Vector{Variable},
+    parameters::Vector{Variable} = Variable[],
+)
+    System(convert(Vector{Expression}, exprs), variables, parameters)
+end
+
+evaluate(F::System, x::AbstractVector) = evaluate(F.expressions, F.variables => x)
+function evaluate(F::System, x::AbstractVector, p::AbstractVector)
+    evaluate(F.expressions, F.variables => x, F.parameters => p)
+end
+(F::System)(x::AbstractVector) = evaluate(F, x)
+(F::System)(x::AbstractVector, p::AbstractVector) = evaluate(F, x, p)
+
+function Base.:(==)(F::System, G::System)
+    F.expressions == G.expressions &&
+    F.variables == G.variables && F.parameters == G.parameters
+end
+
+Base.size(F::System) = (length(F.expressions), length(F.variables))
+Base.size(F::System, i::Integer) = size(F)[i]
+Base.length(F::System) = length(F.expressions)
