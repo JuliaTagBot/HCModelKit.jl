@@ -391,7 +391,9 @@ function evaluate(op::Operation, args::Dict{Variable,<:Any})
     end
 end
 
-(op::Union{Constant,Variable,Operation})(args...) = evaluate(op, args...)
+(op::Constant)(args...) = evaluate(op, args...)
+(op::Variable)(args...) = evaluate(op, args...)
+(op::Operation)(args...) = evaluate(op, args...)
 
 function det(A::AbstractMatrix{<:Expression})
     isequal(size(A)...) || throw(ArgumentError("Cannot compute `det` of a non-square matrix."))
