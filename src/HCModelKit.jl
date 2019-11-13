@@ -15,16 +15,20 @@ export @var,
        variables,
        differentiate,
        monomials,
-       CompiledOperation,
-       CompiledOperationSystem,
-       CompiledOperationHomotopy,
-       compile,
+       CompiledSystem,
+       CompiledHomotopy,
+       System,
+       Homotopy,
        evaluate,
        evaluate!,
        evaluate_gradient,
        evaluate_jacobian!,
        jacobian,
-       jacobian!
+       jacobian!,
+       dt,
+       dt!,
+       dt_jacobian,
+       dt_jacobian!
 
 include("expression.jl")
 include("codegen.jl")

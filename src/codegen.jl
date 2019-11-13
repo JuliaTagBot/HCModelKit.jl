@@ -21,8 +21,9 @@ Base.convert(::Type{Expression}, ::TOperation{F,A1,Nothing}) where {F,A1} =
 Base.convert(::Type{Expression}, ::TOperation{F,A1,A2}) where {F,A1,A2} =
     Operation(F, Expression[Expression(A1), Expression(A2)])
 
-
-
+#############
+## TSystem ##
+#############
 struct TSystem{TE,V,P} end
 
 TSystem(sys::System) = TSystem(sys.expressions, sys.variables, sys.parameters)
@@ -66,10 +67,53 @@ function System(::Type{TSystem{TE,V,P}}) where {TE,V,P}
     System(exprs, vars, params)
 end
 
+###############
+## THomotopy ##
+###############
+
+struct THomotopy{TE,V,T,P} end
+
+THomotopy(sys::Homotopy) =
+    THomotopy(sys.expressions, sys.variables, sys.homotopy_var, sys.parameters)
+function THomotopy(
+    exprs::Vector{<:Expression},
+    var_order::AbstractVector{<:Variable},
+    homotopy_var::Variable,
+    param_order::AbstractVector{<:Variable} = Variable[],
+)
+    TE = tuple(convert.(TExpression, exprs)...)
+    V = tuple((var.name for var in var_order)...)
+    T = homotopy_var.name
+    P = isempty(param_order) ? Nothing : tuple((var.name for var in param_order)...)
+    THomotopy{TE,V,T,P}()
+end
+
+Base.show(io::IO, ::Type{T}) where {T<:THomotopy} = show_info(io, T)
+function Base.show(io::IO, TS::THomotopy)
+    show_info(io, typeof(TS))
+    print(io, "()")
+end
+function show_info(io::IO, ::Type{THomotopy{TE,V,T,P}}) where {TE,V,T,P}
+    n = length(TE)
+    m = length(V)
+    mp = (P == Nothing ? 0 : length(P))
+    print(io, "THomotopy{$n,$m,$mp,#$(hash(TE))}")
+end
+
+
+Homotopy(TS::THomotopy) = Homotopy(typeof(TS))
+function Homotopy(::Type{THomotopy{TE,V,T,P}}) where {TE,V,T,P}
+    exprs = [Expression(e) for e in TE]
+    vars = [Variable(e) for e in V]
+    homotopy_var = Variable(T)
+    params = P == Nothing ? Variable[] : [Variable(v) for v in P]
+    Homotopy(exprs, vars, homotopy_var, params)
+end
+
+
 ###########################
 ## CODEGEN + COMPILATION ##
 ###########################
-
 
 struct InstructionId
     name::Symbol
@@ -185,10 +229,8 @@ end
 
 ## CODEGEN
 
-
 function evaluate end
 function evaluate! end
-function evaluate_gradient end
 function evalute_jacobian end
 function evaluate_jacobian! end
 function jacobian end
@@ -196,7 +238,7 @@ function jacobian! end
 function dt! end
 function dt end
 function jacobian_dt! end
-
+function jacobian_dt end
 
 struct CompiledSystem{T<:TSystem}
     system::System
@@ -208,18 +250,31 @@ Base.size(F::CompiledSystem) = size(F.system)
 Base.size(F::CompiledSystem, i::Integer) = size(F.system, i)
 
 
-function jacobian!(U::AbstractMatrix, S::CompiledSystem, args...)
-    evaluate_jacobian!(nothing, U, S, args...)
-    U
+
+struct CompiledHomotopy{T<:THomotopy}
+    homotopy::Homotopy
 end
-function evaluate_jacobian(S::CompiledSystem, args...)
-    evaluate(S, args...), jacobian(S, args...)
-end
+CompiledHomotopy(H::Homotopy) = CompiledHomotopy{typeof(THomotopy(H))}(H)
+
+Base.length(F::CompiledHomotopy) = length(F.homotopy)
+Base.size(F::CompiledHomotopy) = size(F.homotopy)
+Base.size(F::CompiledHomotopy, i::Integer) = size(F.homotopy, i)
 
 
-function make_indexing(vars, params)
+#################
+## evaluations ##
+#################
+const TExpr = Union{TSystem,THomotopy}
+
+make_indexing(F::System) = make_indexing(F.variables, nothing, F.parameters)
+make_indexing(H::Homotopy) = make_indexing(H.variables, H.homotopy_var, H.parameters)
+function make_indexing(vars, homotopy_var, params)
     lhs = Any[convert(Expr, v) for v in vars]
     rhs = Any[:(x[$i]) for i = 1:length(vars)]
+    if homotopy_var !== nothing
+        push!(lhs, convert(Expr, homotopy_var))
+        push!(rhs, :t)
+    end
     if params !== nothing
         append!(lhs, convert.(Expr, params))
         for i = 1:length(params)
@@ -229,15 +284,24 @@ function make_indexing(vars, params)
     :($(Expr(:tuple, lhs...)) = $(Expr(:tuple, rhs...)))
 end
 
+interpret(T::Type{<:TSystem}) = System(T)
+interpret(T::Type{<:THomotopy}) = Homotopy(T)
 
-function _evaluate_impl(::Type{T}) where {T<:TSystem}
-    sys = System(T)
-    indexing = make_indexing(sys.variables, sys.parameters)
+function jacobian!(U::AbstractMatrix, S::Union{CompiledHomotopy, CompiledSystem}, args...)
+    evaluate_jacobian!(nothing, U, S, args...)
+    U
+end
+function evaluate_jacobian(S::Union{CompiledHomotopy, CompiledSystem}, args...)
+    evaluate(S, args...), jacobian(S, args...)
+end
+
+function _evaluate_impl(::Type{T}) where {T<:TExpr}
+    I = interpret(T)
     quote
-        let $indexing
+        let $(make_indexing(I))
             $(begin
                 list = InstructionList()
-                ids = [convert(Expr, push!(list, fi)) for fi in sys.expressions]
+                ids = [convert(Expr, push!(list, fi)) for fi in I.expressions]
                 quote
                     $(convert(Expr, list))
                     @SVector $(Expr(:vect, ids...))
@@ -247,20 +311,27 @@ function _evaluate_impl(::Type{T}) where {T<:TSystem}
     end
 end
 
-@generated function evaluate(F::CompiledSystem{T}, x, p = nothing) where {T}
+@generated function evaluate(F::CompiledSystem{T}, x::AbstractVector, p = nothing) where {T}
+    _evaluate_impl(T)
+end
+@generated function evaluate(
+    F::CompiledHomotopy{T},
+    x::AbstractVector,
+    t,
+    p = nothing,
+) where {T}
     _evaluate_impl(T)
 end
 
-function _evaluate!_impl(::Type{T}) where {T<:TSystem}
+function _evaluate!_impl(::Type{T}) where {T<:TExpr}
     u = gensym(:u)
-    sys = System(T)
-    indexing = make_indexing(sys.variables, sys.parameters)
+    I = interpret(T)
     quote
         let $u = u
-            let $indexing
+            let $(make_indexing(I))
                 $(begin
                     list = InstructionList()
-                    ids = [convert(Expr, push!(list, fi)) for fi in sys.expressions]
+                    ids = [convert(Expr, push!(list, fi)) for fi in I.expressions]
                     quote
                         $(convert(Expr, list))
                         $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
@@ -272,29 +343,42 @@ function _evaluate!_impl(::Type{T}) where {T<:TSystem}
     end
 end
 
-@generated function evaluate!(u, F::CompiledSystem{T}, x, p = nothing) where {T}
+@generated function evaluate!(
+    u::AbstractVector,
+    F::CompiledSystem{T},
+    x::AbstractVector,
+    p = nothing,
+) where {T}
+    _evaluate!_impl(T)
+end
+@generated function evaluate!(
+    u::AbstractVector,
+    F::CompiledHomotopy{T},
+    x::AbstractVector,
+    t,
+    p = nothing,
+) where {T}
     _evaluate!_impl(T)
 end
 
-function _evaluate_jacobian!_impl(::Type{T}) where {T<:TSystem}
+function _evaluate_jacobian!_impl(::Type{T}) where {T<:TExpr}
     u, U = gensym(:u), gensym(:U)
-    sys = System(T)
-    indexing = make_indexing(sys.variables, sys.parameters)
-    n, m = size(sys)
+    I = interpret(T)
+    n, m = size(I)
     quote
         let ($u, $U) = (u, U)
-            let $indexing
+            let $(make_indexing(I))
                 $(begin
                     list = InstructionList()
                     eval_ids = Vector{Any}(undef, n)
                     jac_ids = Matrix{Any}(undef, n, m)
                     for i = 1:n
-                        fᵢ = sys.expressions[i]
+                        fᵢ = I.expressions[i]
                         eval_ids[i] = convert(Expr, push!(list, fᵢ))
                         for j = 1:m
                             jac_ids[i, j] = convert(
                                 Expr,
-                                push!(list, differentiate(fᵢ, sys.variables[j])),
+                                push!(list, differentiate(fᵢ, I.variables[j])),
                             )
                         end
                     end
@@ -312,20 +396,34 @@ function _evaluate_jacobian!_impl(::Type{T}) where {T<:TSystem}
     end
 end
 
-@generated function evaluate_jacobian!(u, U, F::CompiledSystem{T}, x, p = nothing) where {T}
+@generated function evaluate_jacobian!(
+    u::Union{Nothing,AbstractVector},
+    U::AbstractMatrix,
+    F::CompiledSystem{T},
+    x::AbstractVector,
+    p::Union{Nothing,AbstractVector} = nothing,
+) where {T}
+    _evaluate_jacobian!_impl(T)
+end
+@generated function evaluate_jacobian!(
+    u::Union{Nothing,AbstractVector},
+    U::AbstractMatrix,
+    F::CompiledHomotopy{T},
+    x::AbstractVector,
+    t,
+    p::Union{Nothing,AbstractVector} = nothing,
+) where {T}
     _evaluate_jacobian!_impl(T)
 end
 
-
-function _jacobian_impl(::Type{T}) where {T<:TSystem}
-    sys = System(T)
-    indexing = make_indexing(sys.variables, sys.parameters)
-    n, m = size(sys)
+function _jacobian_impl(::Type{T}) where {T<:TExpr}
+    I = interpret(T)
+    n, m = size(I)
     quote
-        let $indexing
+        let $(make_indexing(I))
             $(begin
                 list = InstructionList()
-                jac_ids = [convert(Expr, push!(list, differentiate(fᵢ, v))) for fᵢ in sys.expressions, v in sys.variables]
+                jac_ids = [convert(Expr, push!(list, differentiate(fᵢ, v))) for fᵢ in I.expressions, v in I.variables]
                 quote
                     $(convert(Expr, list))
                     @SMatrix $(Expr(:vcat, map(1:n) do i
@@ -341,320 +439,115 @@ end
     _jacobian_impl(T)
 end
 
+@generated function jacobian(F::CompiledHomotopy{T}, x, t, p = nothing) where {T}
+    _jacobian_impl(T)
+end
 
+function _dt_impl(::Type{T}) where {T<:THomotopy}
+    I = interpret(T)
+    quote
+        let $(make_indexing(I))
+            $(begin
+                list = InstructionList()
+                ids = map(I.expressions) do fi
+                    convert(Expr, push!(list, differentiate(fi, I.homotopy_var)))
+                end
+                quote
+                    $(convert(Expr, list))
+                    @SVector $(Expr(:vect, ids...))
+                end
+            end)
+        end
+    end
+end
 
-# function compile(
-#     f::Vector{Operation},
-#     vars::Vector{Variable},
-#     params::Union{Nothing,Vector{Variable}} = nothing,
-# )
-#     f = simplify.(f)
-#     check_vars_params(f, vars, params)
-#
-#     name = Symbol("CompiledSystem##", foldr(hash, f; init = UInt(0)))
-#     indexing = make_indexing(vars, params)
-#     func_args = [:(x::AbstractVector)]
-#     params !== nothing && push!(func_args, :(p::AbstractVector))
-#
-#     u = gensym(:u)
-#     U = gensym(:U)
-#
-#     compiled = @eval begin
-#         struct $name <: CompiledSystem
-#             op::Vector{Operation}
-#             vars::Vector{Variable}
-#             params::Union{Nothing,Vector{Variable}}
-#         end
-#
-#         function _evaluate!($u::AbstractVector, ::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
-#                         0
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function evaluate(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(Expr(:vect, ids...))
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function evaluate_jacobian!(
-#             $u::Union{AbstractVector,Nothing},
-#             $U::AbstractMatrix,
-#             ::$name,
-#             $(func_args...),
-#         )
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     eval_ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
-#                     quote
-#                         $(convert(Expr, list))
-#                         if !($u isa Nothing)
-#                             $(map(i -> :($u[$i] = $(eval_ids[i])), 1:length(eval_ids))...)
-#                         end
-#                         $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
-#                         nothing
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function jacobian(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(Expr(:vcat, map(1:length(f)) do i
-#                             Expr(:row, jac_ids[i, :]...)
-#                         end...))
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         $name
-#     end
-#     Base.invokelatest(compiled, f, vars, params)
-# end
+@generated function dt(H::CompiledHomotopy{T}, x::AbstractVector, t, p = nothing) where {T}
+    _dt_impl(T)
+end
 
+function _dt!_impl(::Type{T}) where {T<:THomotopy}
+    u = gensym(:u)
+    I = interpret(T)
+    quote
+        let $u = u
+            let $(make_indexing(I))
+                $(begin
+                    list = InstructionList()
+                    ids = map(I.expressions) do fi
+                        convert(Expr, push!(list, differentiate(fi, I.homotopy_var)))
+                    end
+                    quote
+                        $(convert(Expr, list))
+                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                    end
+                end)
+            end
+        end
+        u
+    end
+end
 
+@generated function dt!(
+    u::AbstractVector,
+    H::CompiledHomotopy{T},
+    x::AbstractVector,
+    t,
+    p = nothing,
+) where {T}
+    _dt!_impl(T)
+end
 
-#
-# @inline @generated function evaluate!(
-#     u::U,
-#     F::S,
-#     x::X,
-# ) where {U<:AbstractVector,S<:CompiledSystem,X<:AbstractVector}
-#     quote
-#         # c_func = @cfunction($_evaluate!, Int, ($U, $CPS, $X))
-#         cfunc = $(Expr(:cfunction, Base.CFunction, :(HCModelKit._evaluate!), :Int, :(Core.svec(U, S, X)), :(:ccall)))
-#         ccall(cfunc.ptr, Int, ($U, $S, $X), u, F, x)
-#         u
-#     end
-# end
+####
 
-# Homotopies
-# abstract type CompiledOperationHomotopy end
-#
-# Base.length(F::CompiledOperationHomotopy) = size(F, 1)
-# Base.size(F::CompiledOperationHomotopy) = (length(F.op), length(F.vars))
-# Base.size(F::CompiledOperationHomotopy, i::Integer) = size(F)[i]
-# function jacobian!(U::AbstractMatrix, S::CompiledOperationHomotopy, args...)
-#     evaluate_jacobian!(nothing, U, S, args...)
-#     U
-# end
-# function evaluate_jacobian(S::CompiledOperationHomotopy, args...)
-#     evaluate(S, args...), jacobian(S, args...)
-# end
-#
-# function compile(
-#     f::Vector{Operation},
-#     vars::Vector{Variable},
-#     homotopy_var::Variable,
-#     params::Union{Nothing,Vector{Variable}} = nothing,
-# )
-#     f = simplify.(f)
-#     check_vars_params(f, [vars; homotopy_var], params)
-#
-#     name = Symbol("CompiledOperationHomotopy##", foldr(hash, f; init = UInt(0)))
-#     indexing = make_indexing(vars, params)
-#     @show indexing
-#     func_args = [:(x::AbstractVector), :($(convert(Expr, homotopy_var))::Number)]
-#     params !== nothing && push!(func_args, :(p::AbstractVector))
-#
-#     u = gensym(:u)
-#     U = gensym(:U)
-#
-#     compiled = @eval begin
-#         struct $name <: CompiledOperationHomotopy
-#             op::Vector{Operation}
-#             vars::Vector{Variable}
-#             homotopy_var::Variable
-#             params::Union{Nothing,Vector{Variable}}
-#         end
-#
-#         function evaluate!($u::AbstractVector, ::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
-#                         $u
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function evaluate(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(Expr(:vect, ids...))
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function evaluate_jacobian!(
-#             $u::Union{AbstractVector,Nothing},
-#             $U::AbstractMatrix,
-#             ::$name,
-#             $(func_args...),
-#         )
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     eval_ids = [convert(Expr, push!(list, fi)) for fi in f]
-#                     jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
-#                     quote
-#                         $(convert(Expr, list))
-#                         if !($u isa Nothing)
-#                             $(map(i -> :($u[$i] = $(eval_ids[i])), 1:length(eval_ids))...)
-#                         end
-#                         $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
-#                         nothing
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function jacobian(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(Expr(:vcat, map(1:length(f)) do i
-#                             Expr(:row, jac_ids[i, :]...)
-#                         end...))
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function dt!($u::AbstractVector, ::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, differentiate(fi, homotopy_var))) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
-#                         $u
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function dt(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [push!(list, differentiate(fi, homotopy_var)) for fi in f]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(Expr(:vect, convert.(Expr, ids)...))
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         function jacobian_dt!(
-#             $U::AbstractMatrix,
-#             $u::AbstractVector,
-#             ::$name,
-#             $(func_args...),
-#         )
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     ids = [convert(Expr, push!(list, differentiate(fi, homotopy_var))) for fi in f]
-#                     jac_ids = [convert(Expr, push!(list, differentiate(fi, v))) for fi in f, v in vars]
-#                     quote
-#                         $(convert(Expr, list))
-#                         $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
-#                         $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:length(f), j = 1:length(vars)])...)
-#                         nothing
-#                     end
-#                 end)
-#             end
-#         end
-#
-#         $name
-#     end
-#
-#     Base.invokelatest(compiled, f, vars, homotopy_var, params)
-# end
+function _dt_jacobian!_impl(::Type{T}) where {T<:THomotopy}
+    u, U = gensym(:u), gensym(:U)
+    I = interpret(T)
+    n, m = size(I)
+    quote
+        let ($u, $U) = (u, U)
+            let $(make_indexing(I))
+                $(begin
+                    list = InstructionList()
+                    dt_ids = Vector{Any}(undef, n)
+                    jac_ids = Matrix{Any}(undef, n, m)
+                    for i = 1:n
+                        fᵢ = I.expressions[i]
+                        dt_ids[i] = convert(
+                            Expr,
+                            push!(list, differentiate(fᵢ, I.homotopy_var)),
+                        )
+                        for j = 1:m
+                            jac_ids[i, j] = convert(
+                                Expr,
+                                push!(list, differentiate(fᵢ, I.variables[j])),
+                            )
+                        end
+                    end
+                    quote
+                        $(convert(Expr, list))
+                        if !($u isa Nothing)
+                            $(map(i -> :($u[$i] = $(dt_ids[i])), 1:n)...)
+                        end
+                        $(vec([:($U[$i, $j] = $(jac_ids[i, j])) for i = 1:n, j = 1:m])...)
+                        nothing
+                    end
+                end)
+            end
+        end
+    end
+end
 
+@generated function dt_jacobian!(
+    u::AbstractVector,
+    U::AbstractMatrix,
+    H::CompiledHomotopy{T},
+    x::AbstractVector,
+    t,
+    p = nothing,
+) where {T}
+    _dt_jacobian!_impl(T)
+end
 
-# function compile(
-#     f::Operation,
-#     vars::AbstractVector{Variable},
-#     params::Union{Nothing,AbstractVector{Variable}} = nothing,
-# )
-#     f = simplify(f)
-#     check_vars_params(f, vars, params)
-#
-#     name = Symbol("CompiledOperation##", hash(f))
-#     indexing = make_indexing(vars, params)
-#     func_args = [:(x::AbstractVector)]
-#     params !== nothing && push!(func_args, :(p::AbstractVector))
-#
-#     compiled = @eval begin
-#         struct $name <: CompiledOperation
-#             op::Operation
-#             vars::Vector{Variable}
-#             params::Union{Nothing,Vector{Variable}}
-#         end
-#
-#         function evaluate(::$name, $(func_args...))
-#             let $indexing
-#                 $(convert(Expr, InstructionList(f)))
-#             end
-#         end
-#
-#         function evaluate_gradient(::$name, $(func_args...))
-#             let $indexing
-#                 $(begin
-#                     list = InstructionList()
-#                     f_x = convert(Expr, push!(list, f))
-#                     grad_x = let
-#                         ids = [push!(list, differentiate(f, v)) for v in vars]
-#                         :(@SVector $(Expr(:vect, convert.(Expr, ids)...)))
-#                     end
-#                     quote
-#                         $(convert(Expr, list))
-#                         $f_x, $grad_x
-#                     end
-#                 end)
-#             end
-#         end
-#         $name
-#     end
-#     compiled(f, vars, params)
-# end
+function dt_jacobian(H::CompiledHomotopy{T}, x::AbstractVector, t, p = nothing) where {T}
+    dt(H, x, t, p), jacobian(H, x, t, p)
+end

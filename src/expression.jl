@@ -1,6 +1,5 @@
 abstract type Expression end
 
-
 ###############
 ## VARIABLES ##
 ###############
@@ -596,6 +595,9 @@ function td_order(x, y)
     sx == sy ? x < y : sx < sy
 end
 
+############
+## System ##
+############
 
 struct System
     expressions::Vector{Expression}
@@ -643,3 +645,50 @@ end
 Base.size(F::System) = (length(F.expressions), length(F.variables))
 Base.size(F::System, i::Integer) = size(F)[i]
 Base.length(F::System) = length(F.expressions)
+
+##############
+## Homotopy ##
+##############
+struct Homotopy
+    expressions::Vector{Expression}
+    variables::Vector{Variable}
+    homotopy_var::Variable
+    parameters::Vector{Variable}
+
+    function Homotopy(
+        exprs::Vector{Expression},
+        vars::Vector{Variable},
+        homotopy_var::Variable,
+        params::Vector{Variable},
+    )
+        check_vars_params(exprs, [vars; homotopy_var], params)
+        new(exprs, vars, homotopy_var, params)
+    end
+end
+
+
+function Homotopy(
+    exprs::Vector{<:Expression},
+    variables::Vector{Variable},
+    homotopy_var::Variable,
+    parameters::Vector{Variable} = Variable[],
+)
+    Homotopy(convert(Vector{Expression}, exprs), variables, homotopy_var, parameters)
+end
+
+evaluate(F::Homotopy, x::AbstractVector, t) =
+    evaluate(F.expressions, F.variables => x, F.homotopy_var => t)
+function evaluate(F::Homotopy, x::AbstractVector, t, p::AbstractVector)
+    evaluate(F.expressions, F.variables => x, F.homotopy_var => t, F.parameters => p)
+end
+(F::Homotopy)(x::AbstractVector, t) = evaluate(F, x, t)
+(F::Homotopy)(x::AbstractVector, t, p::AbstractVector) = evaluate(F, x, t, p)
+
+function Base.:(==)(F::Homotopy, G::Homotopy)
+    F.expressions == G.expressions &&
+    F.variables == G.variables && F.parameters == G.parameters
+end
+
+Base.size(F::Homotopy) = (length(F.expressions), length(F.variables))
+Base.size(F::Homotopy, i::Integer) = size(F)[i]
+Base.length(F::Homotopy) = length(F.expressions)

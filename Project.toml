@@ -4,19 +4,19 @@ authors = ["Sascha Timme <sascha.timme@gmail.com>"]
 version = "0.1.0"
 
 [deps]
-DiffRules = "b552c78f-8df3-52c6-915a-8e097449b14b"
 Latexify = "23fbe1c1-3f47-55db-b15f-69d7ec21a316"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-NaNMath = "77ba4419-2d1f-58cd-9bb1-8ffee604a2e3"
 OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
-SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [compat]
 julia = "1"
+Latexify = "0.12"
+OrderedCollections = "1.1"
+StaticArrays = "0.10, 0.11, 0.12"
 
 [extras]
+FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
