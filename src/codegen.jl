@@ -26,7 +26,7 @@ Base.convert(::Type{Expression}, ::TOperation{F,A1,A2}) where {F,A1,A2} =
 #############
 struct TSystem{TE,V,P} end
 
-TSystem(sys::System) = TSystem(sys.expressions, sys.variables, sys.parameters)
+type_level(sys::System) = typeof(TSystem(sys.expressions, sys.variables, sys.parameters))
 function TSystem(
     exprs::Vector{<:Expression},
     var_order::AbstractVector{<:Variable},
@@ -55,8 +55,8 @@ function show_info(io::IO, ::Type{TSystem{TE,V,P}}) where {TE,V,P}
 end
 
 
-System(TS::TSystem) = System(typeof(TS))
-function System(::Type{TSystem{TE,V,P}}) where {TE,V,P}
+interpret(TS::TSystem) = interpret(typeof(TS))
+function interpret(::Type{TSystem{TE,V,P}}) where {TE,V,P}
     exprs = [Expression(e) for e in TE]
     vars = [Variable(e) for e in V]
     if P == Nothing
@@ -73,17 +73,17 @@ end
 
 struct THomotopy{TE,V,T,P} end
 
-THomotopy(sys::Homotopy) =
-    THomotopy(sys.expressions, sys.variables, sys.homotopy_var, sys.parameters)
+type_level(sys::Homotopy) =
+    typeof(THomotopy(sys.expressions, sys.variables, sys.t, sys.parameters))
 function THomotopy(
     exprs::Vector{<:Expression},
     var_order::AbstractVector{<:Variable},
-    homotopy_var::Variable,
+    t::Variable,
     param_order::AbstractVector{<:Variable} = Variable[],
 )
     TE = tuple(convert.(TExpression, exprs)...)
     V = tuple((var.name for var in var_order)...)
-    T = homotopy_var.name
+    T = t.name
     P = isempty(param_order) ? Nothing : tuple((var.name for var in param_order)...)
     THomotopy{TE,V,T,P}()
 end
@@ -100,16 +100,14 @@ function show_info(io::IO, ::Type{THomotopy{TE,V,T,P}}) where {TE,V,T,P}
     print(io, "THomotopy{$n,$m,$mp,#$(hash(TE))}")
 end
 
-
-Homotopy(TS::THomotopy) = Homotopy(typeof(TS))
-function Homotopy(::Type{THomotopy{TE,V,T,P}}) where {TE,V,T,P}
+interpret(TS::THomotopy) = interpret(typeof(TS))
+function interpret(::Type{THomotopy{TE,V,T,P}}) where {TE,V,T,P}
     exprs = [Expression(e) for e in TE]
     vars = [Variable(e) for e in V]
-    homotopy_var = Variable(T)
+    t = Variable(T)
     params = P == Nothing ? Variable[] : [Variable(v) for v in P]
-    Homotopy(exprs, vars, homotopy_var, params)
+    Homotopy(exprs, vars, t, params)
 end
-
 
 ###########################
 ## CODEGEN + COMPILATION ##
@@ -156,19 +154,6 @@ end
 function InstructionList(; var::Symbol = :ι, n::Base.RefValue{Int} = Ref(0))
     instructions = OrderedDict{Instruction,InstructionId}()
     InstructionList(instructions, var, n)
-end
-function InstructionList(op::Expression; kwargs...)
-    list = InstructionList(; kwargs...)
-    push!(list, op)
-    list
-end
-
-function Base.push!(v::InstructionList, i::Instruction, id::InstructionId)
-    if haskey(v.instructions, i)
-        push!(v.instructions, Instruction(v.instructions[i]) => id)
-    else
-        push!(v.instructions, i => id)
-    end
 end
 
 function Base.push!(v::InstructionList, i::Instruction; id_var::Symbol = v.var)
@@ -228,38 +213,22 @@ end
 
 
 ## CODEGEN
-
-function evaluate end
-function evaluate! end
-function evalute_jacobian end
-function evaluate_jacobian! end
-function jacobian end
-function jacobian! end
-function dt! end
-function dt end
-function jacobian_dt! end
-function jacobian_dt end
-
-struct CompiledSystem{T<:TSystem}
-    system::System
+struct Compiled{T1<:Union{TSystem,THomotopy},T2<:Union{System,Homotopy}}
+    obj::T2
 end
-CompiledSystem(sys::System) = CompiledSystem{typeof(TSystem(sys))}(sys)
+Compiled(obj::T) where {T<:Union{System,Homotopy}} = Compiled{type_level(obj),T}(obj)
 
-Base.length(F::CompiledSystem) = length(F.system)
-Base.size(F::CompiledSystem) = size(F.system)
-Base.size(F::CompiledSystem, i::Integer) = size(F.system, i)
+Base.size(C::Compiled) = size(C.obj)
+Base.size(C::Compiled, i::Integer) = size(C.obj, i)
+Base.length(C::Compiled) = length(C.obj)
 
+const CompiledSystem{T<:TSystem} = Compiled{T,System}
+const CompiledHomotopy{T<:THomotopy} = Compiled{T,Homotopy}
 
+compile(F::System) = Compiled(F)
+compile(H::Homotopy) = Compiled(H)
 
-struct CompiledHomotopy{T<:THomotopy}
-    homotopy::Homotopy
-end
-CompiledHomotopy(H::Homotopy) = CompiledHomotopy{typeof(THomotopy(H))}(H)
-
-Base.length(F::CompiledHomotopy) = length(F.homotopy)
-Base.size(F::CompiledHomotopy) = size(F.homotopy)
-Base.size(F::CompiledHomotopy, i::Integer) = size(F.homotopy, i)
-
+interpreted(C::Compiled) = C.obj
 
 #################
 ## evaluations ##
@@ -267,12 +236,12 @@ Base.size(F::CompiledHomotopy, i::Integer) = size(F.homotopy, i)
 const TExpr = Union{TSystem,THomotopy}
 
 make_indexing(F::System) = make_indexing(F.variables, nothing, F.parameters)
-make_indexing(H::Homotopy) = make_indexing(H.variables, H.homotopy_var, H.parameters)
-function make_indexing(vars, homotopy_var, params)
+make_indexing(H::Homotopy) = make_indexing(H.variables, H.t, H.parameters)
+function make_indexing(vars, t, params)
     lhs = Any[convert(Expr, v) for v in vars]
     rhs = Any[:(x[$i]) for i = 1:length(vars)]
-    if homotopy_var !== nothing
-        push!(lhs, convert(Expr, homotopy_var))
+    if t !== nothing
+        push!(lhs, convert(Expr, t))
         push!(rhs, :t)
     end
     if params !== nothing
@@ -287,11 +256,11 @@ end
 interpret(T::Type{<:TSystem}) = System(T)
 interpret(T::Type{<:THomotopy}) = Homotopy(T)
 
-function jacobian!(U::AbstractMatrix, S::Union{CompiledHomotopy, CompiledSystem}, args...)
+function jacobian!(U::AbstractMatrix, S::Compiled, args...)
     evaluate_jacobian!(nothing, U, S, args...)
     U
 end
-function evaluate_jacobian(S::Union{CompiledHomotopy, CompiledSystem}, args...)
+function evaluate_jacobian(S::Compiled, args...)
     evaluate(S, args...), jacobian(S, args...)
 end
 
@@ -314,6 +283,7 @@ end
 @generated function evaluate(F::CompiledSystem{T}, x::AbstractVector, p = nothing) where {T}
     _evaluate_impl(T)
 end
+(F::CompiledSystem)(x, p = nothing) = evaluate(F, x, p)
 @generated function evaluate(
     F::CompiledHomotopy{T},
     x::AbstractVector,
@@ -322,6 +292,7 @@ end
 ) where {T}
     _evaluate_impl(T)
 end
+(H::CompiledHomotopy)(x, t, p = nothing) = evaluate(H, x, t, p)
 
 function _evaluate!_impl(::Type{T}) where {T<:TExpr}
     u = gensym(:u)
@@ -376,10 +347,7 @@ function _evaluate_jacobian!_impl(::Type{T}) where {T<:TExpr}
                         fᵢ = I.expressions[i]
                         eval_ids[i] = convert(Expr, push!(list, fᵢ))
                         for j = 1:m
-                            jac_ids[i, j] = convert(
-                                Expr,
-                                push!(list, differentiate(fᵢ, I.variables[j])),
-                            )
+                            jac_ids[i, j] = convert(Expr, push!(list, I.jacobian[i, j]))
                         end
                     end
                     quote
@@ -423,12 +391,10 @@ function _jacobian_impl(::Type{T}) where {T<:TExpr}
         let $(make_indexing(I))
             $(begin
                 list = InstructionList()
-                jac_ids = [convert(Expr, push!(list, differentiate(fᵢ, v))) for fᵢ in I.expressions, v in I.variables]
+                jac_ids = map(e -> convert(Expr, push!(list, e)), I.jacobian)
                 quote
                     $(convert(Expr, list))
-                    @SMatrix $(Expr(:vcat, map(1:n) do i
-                        Expr(:row, jac_ids[i, :]...)
-                    end...))
+                    @SMatrix $(Expr(:vcat, (Expr(:row, jac_ids[i, :]...) for i = 1:n)...))
                 end
             end)
         end
@@ -449,9 +415,7 @@ function _dt_impl(::Type{T}) where {T<:THomotopy}
         let $(make_indexing(I))
             $(begin
                 list = InstructionList()
-                ids = map(I.expressions) do fi
-                    convert(Expr, push!(list, differentiate(fi, I.homotopy_var)))
-                end
+                ids = map(e -> convert(Expr, push!(list, e)), I.dt)
                 quote
                     $(convert(Expr, list))
                     @SVector $(Expr(:vect, ids...))
@@ -473,12 +437,10 @@ function _dt!_impl(::Type{T}) where {T<:THomotopy}
             let $(make_indexing(I))
                 $(begin
                     list = InstructionList()
-                    ids = map(I.expressions) do fi
-                        convert(Expr, push!(list, differentiate(fi, I.homotopy_var)))
-                    end
+                    ids = map(e -> convert(Expr, push!(list, e)), I.dt)
                     quote
                         $(convert(Expr, list))
-                        $(map(i -> :($u[$i] = $(ids[i])), 1:length(ids))...)
+                        $((:($u[$i] = $(ids[i])) for i = 1:length(ids))...)
                     end
                 end)
             end
@@ -512,15 +474,9 @@ function _dt_jacobian!_impl(::Type{T}) where {T<:THomotopy}
                     jac_ids = Matrix{Any}(undef, n, m)
                     for i = 1:n
                         fᵢ = I.expressions[i]
-                        dt_ids[i] = convert(
-                            Expr,
-                            push!(list, differentiate(fᵢ, I.homotopy_var)),
-                        )
+                        dt_ids[i] = convert(Expr, push!(list, I.dt[i]))
                         for j = 1:m
-                            jac_ids[i, j] = convert(
-                                Expr,
-                                push!(list, differentiate(fᵢ, I.variables[j])),
-                            )
+                            jac_ids[i, j] = convert(Expr, push!(list, I.jacobian[i, j]))
                         end
                     end
                     quote

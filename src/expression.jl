@@ -328,7 +328,10 @@ julia> evaluate(x * y, [x,y] => [2, 3])
 """
 function evaluate(
     expr::Union{Expression,AbstractArray{<:Expression}},
-    args::Pair{<:AbstractArray{<:Variable,N},<:AbstractArray{<:Any,N}}...,
+    args::Union{
+        Pair{Variable,<:Any},
+        Pair{<:AbstractArray{Variable},<:AbstractArray{<:Any}},
+    }...,
 ) where {N}
     D = Dict{Variable,Any}()
     for arg in args
@@ -601,10 +604,46 @@ end
 ## System ##
 ############
 
+function check_vars_params(f, vars, params)
+    vars_params = params === nothing ? vars : [vars; params]
+    Δ = setdiff(variables(f), vars_params)
+    isempty(Δ) || throw(ArgumentError("Not all variables or parameters of the system are given. Missing: " *
+                                      join(Δ, ", ")))
+    nothing
+end
+
+"""
+    System(exprs, vars, parameters = Variable[])
+
+Create a system from the given `exprs`. `vars` are the given variables and determines
+the variable ordering.
+
+## Example
+```julia
+julia> @var x y;
+julia> H = System([x^2, y^2], [y, x]);
+julia> H([2, 3], 0)
+2-element Array{Int64,1}:
+ 4
+ 9
+```
+
+It is also possible to declare additional variables.
+```julia
+julia> @var x y t a b;
+julia> H = Homotopy([x^2 + a, y^2 + b^2], [x, y], [a, b]);
+julia> H([2, 3], [5, 2])
+2-element Array{Int64,1}:
+ 9
+ 13
+```
+"""
 struct System
     expressions::Vector{Expression}
     variables::Vector{Variable}
     parameters::Vector{Variable}
+    # automatically computed
+    jacobian::Matrix{Expression}
 
     function System(
         exprs::Vector{Expression},
@@ -612,16 +651,9 @@ struct System
         params::Vector{Variable},
     )
         check_vars_params(exprs, vars, params)
-        new(exprs, vars, params)
+        jacobian = [differentiate(e, v) for e in exprs, v in vars]
+        new(exprs, vars, params, jacobian)
     end
-end
-
-function check_vars_params(f, vars, params)
-    vars_params = params === nothing ? vars : [vars; params]
-    Δ = setdiff(variables(f), vars_params)
-    isempty(Δ) || throw(ArgumentError("Not all variables or parameters of the system are given. Missing: " *
-                                      join(Δ, ", ")))
-    nothing
 end
 
 function System(
@@ -632,12 +664,40 @@ function System(
     System(convert(Vector{Expression}, exprs), variables, parameters)
 end
 
+function Base.show(io::IO, F::System)
+    if !get(io, :compact, false)
+        println(io, "System")
+        print(io, " variables: ", join(name.(F.variables), ", "))
+        if !isempty(F.parameters)
+            print(io, "\n parameters: ", join(name.(F.parameters), ", "))
+        end
+        print(io, "\n\n")
+        for i in 1:length(F)
+            print(io, " ", F.expressions[i])
+            i < length(F) && print(io, "\n")
+        end
+    else
+        print(io, "[")
+        for i in 1:length(F)
+            print(io, F.expressions[i])
+            i < length(F) && print(io, ", ")
+        end
+        print(io, "]")
+    end
+end
+
 evaluate(F::System, x::AbstractVector) = evaluate(F.expressions, F.variables => x)
 function evaluate(F::System, x::AbstractVector, p::AbstractVector)
     evaluate(F.expressions, F.variables => x, F.parameters => p)
 end
 (F::System)(x::AbstractVector) = evaluate(F, x)
 (F::System)(x::AbstractVector, p::AbstractVector) = evaluate(F, x, p)
+
+jacobian(F::System, x::AbstractVector) = evaluate(F.jacobian, F.variables => x)
+function jacobian(F::System, x::AbstractVector, p::AbstractVector)
+    evaluate(F.jacobian, F.variables => x, F.parameters => p)
+end
+
 
 function Base.:(==)(F::System, G::System)
     F.expressions == G.expressions &&
@@ -651,46 +711,118 @@ Base.length(F::System) = length(F.expressions)
 ##############
 ## Homotopy ##
 ##############
+"""
+    Homotopy(exprs, vars, t, parameters = Variable[])
+
+Create a homotopy from the given `exprs`. `vars` are the given variables and determines
+the variable ordering, `t` is the dedicated variable along which is "homotopied".
+
+## Example
+```julia
+julia> @var x y t;
+julia> H = Homotopy([x + t, y + 2t], [y, x], t);
+julia> H([2, 3], 0)
+2-element Array{Int64,1}:
+ 3
+ 2
+
+
+julia> H([2, 3], 1)
+2-element Array{Int64,1}:
+ 4
+ 4
+```
+
+It is also possible to declare additional variables.
+```julia
+julia> @var x y t a b;
+julia> H = Homotopy([x^2 + t*a, y^2 + t*b], [x, y], t, [a, b]);
+julia> H([2, 3], 1, [5, 2])
+2-element Array{Int64,1}:
+ 9
+ 11
+```
+"""
 struct Homotopy
     expressions::Vector{Expression}
     variables::Vector{Variable}
-    homotopy_var::Variable
+    t::Variable
     parameters::Vector{Variable}
+    # automatically computed
+    jacobian::Matrix{Expression}
+    dt::Vector{Expression}
 
     function Homotopy(
         exprs::Vector{Expression},
         vars::Vector{Variable},
-        homotopy_var::Variable,
+        t::Variable,
         params::Vector{Variable},
     )
-        check_vars_params(exprs, [vars; homotopy_var], params)
-        new(exprs, vars, homotopy_var, params)
+        check_vars_params(exprs, [vars; t], params)
+        jacobian = [differentiate(e, v) for e in exprs, v in vars]
+        dt = [differentiate(e, t) for e in exprs]
+        new(exprs, vars, t, params, jacobian, dt)
     end
 end
-
 
 function Homotopy(
     exprs::Vector{<:Expression},
     variables::Vector{Variable},
-    homotopy_var::Variable,
+    t::Variable,
     parameters::Vector{Variable} = Variable[],
 )
-    Homotopy(convert(Vector{Expression}, exprs), variables, homotopy_var, parameters)
+    Homotopy(convert(Vector{Expression}, exprs), variables, t, parameters)
 end
 
-evaluate(F::Homotopy, x::AbstractVector, t) =
-    evaluate(F.expressions, F.variables => x, F.homotopy_var => t)
-function evaluate(F::Homotopy, x::AbstractVector, t, p::AbstractVector)
-    evaluate(F.expressions, F.variables => x, F.homotopy_var => t, F.parameters => p)
+function Base.show(io::IO, H::Homotopy)
+    if !get(io, :compact, false)
+        println(io, "Homotopy in ", H.t)
+        print(io, " variables: ", join(name.(H.variables), ", "))
+        if !isempty(H.parameters)
+            print(io, "\n parameters: ", join(name.(H.parameters), ", "))
+        end
+        print(io, "\n\n")
+        for i in 1:length(H)
+            print(io, " ", H.expressions[i])
+            i < length(H) && print(io, "\n")
+        end
+    else
+        print(io, "[")
+        for i in 1:length(H)
+            print(io, H.expressions[i])
+            i < length(H) && print(io, ", ")
+        end
+        print(io, "]")
+    end
 end
-(F::Homotopy)(x::AbstractVector, t) = evaluate(F, x, t)
-(F::Homotopy)(x::AbstractVector, t, p::AbstractVector) = evaluate(F, x, t, p)
 
-function Base.:(==)(F::Homotopy, G::Homotopy)
-    F.expressions == G.expressions &&
-    F.variables == G.variables && F.parameters == G.parameters
+evaluate(H::Homotopy, x::AbstractVector, t) =
+    evaluate(H.expressions, H.variables => x, H.t => t)
+function evaluate(H::Homotopy, x::AbstractVector, t, p::AbstractVector)
+    evaluate(H.expressions, H.variables => x, H.t => t, H.parameters => p)
+end
+(H::Homotopy)(x::AbstractVector, t) = evaluate(H, x, t)
+(H::Homotopy)(x::AbstractVector, t, p::AbstractVector) = evaluate(H, x, t, p)
+
+function jacobian(H::Homotopy, x::AbstractVector, t)
+    evaluate(H.jacobian, H.variables => x, H.t => t)
+end
+function jacobian(H::Homotopy, x::AbstractVector, t, p::AbstractVector)
+    evaluate(H.jacobian, H.variables => x, H.t => t, H.parameters => p)
 end
 
-Base.size(F::Homotopy) = (length(F.expressions), length(F.variables))
-Base.size(F::Homotopy, i::Integer) = size(F)[i]
-Base.length(F::Homotopy) = length(F.expressions)
+function dt(H::Homotopy, x::AbstractVector, t)
+    evaluate(H.dt, H.variables => x, H.t => t)
+end
+function dt(H::Homotopy, x::AbstractVector, t, p::AbstractVector)
+    evaluate(H.dt, H.variables => x, H.t => t, H.parameters => p)
+end
+
+function Base.:(==)(H::Homotopy, G::Homotopy)
+    H.expressions == G.expressions &&
+    H.variables == G.variables && H.parameters == G.parameters
+end
+
+Base.size(H::Homotopy) = (length(H.expressions), length(H.variables))
+Base.size(H::Homotopy, i::Integer) = size(H)[i]
+Base.length(H::Homotopy) = length(H.expressions)
