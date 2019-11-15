@@ -89,6 +89,10 @@ using LinearAlgebra: det, ⋅
          (a * c * -z) / (x + y)"""
 
         F = compile(f)
+        @test startswith(
+            sprint(show, F),
+            "Compiled{TSystem{3,3,3,#6150977781220957453},System}",
+        )
 
         @test size(F) == (3, 3)
         @test length(F) == 3
@@ -205,6 +209,11 @@ using LinearAlgebra: det, ⋅
          (4 * x ^ 2 * z ^ 2 * a * b * y + c * 4 * z) - 6 * x * y * z ^ 2"""
 
         H = compile(h)
+        @test startswith(
+            sprint(show, H),
+            "Compiled{THomotopy{2,3,3,#16936680423293589067},Homotopy}",
+        )
+
         @test size(H) == (2, 3)
         @test size(H, 1) == 2
         @test size(H, 2) == 3
@@ -275,7 +284,7 @@ using LinearAlgebra: det, ⋅
             @var x[1:2] a[1:5] c[1:6] y[1:2, 1:5]
 
             #tangential conics
-            f = sum([a;1] .* HCModelKit.monomials(x, 2))
+            f = sum([a; 1] .* HCModelKit.monomials(x, 2))
             ∇ = differentiate(f, x)
             #5 conics
             g = sum(c .* HCModelKit.monomials(x, 2))
