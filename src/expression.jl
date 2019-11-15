@@ -345,22 +345,6 @@ function evaluate(
         evaluate(expr, D)
     end
 end
-function evaluate(
-    expr::Union{Expression,AbstractArray{<:Expression}},
-    args::Pair{<:AbstractArray{<:Variable,N},<:AbstractArray{T,N}}...,
-) where {T,N}
-    D = Dict{Variable,T}()
-    for arg in args
-        for (k, v) in zip(arg...)
-            D[k] = v
-        end
-    end
-    if expr isa AbstractArray
-        map(e -> evaluate(e, D), expr)
-    else
-        evaluate(expr, D)
-    end
-end
 evaluate(op::Constant, args::Dict{Variable,<:Any}) = op.value
 evaluate(op::Variable, args::Dict{Variable,<:Any}) = args[op]
 function evaluate(op::Operation, args::Dict{Variable,<:Any})
