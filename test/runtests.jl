@@ -91,7 +91,7 @@ using LinearAlgebra: det, ⋅
         F = compile(f)
         @test startswith(
             sprint(show, F),
-            "Compiled{TSystem{3,3,3,#6150977781220957453},System}",
+            "Compiled{TSystem{3,3,3,#",
         )
 
         @test size(F) == (3, 3)
@@ -211,7 +211,7 @@ using LinearAlgebra: det, ⋅
         H = compile(h)
         @test startswith(
             sprint(show, H),
-            "Compiled{THomotopy{2,3,3,#16936680423293589067},Homotopy}",
+            "Compiled{THomotopy{2,3,3,#",
         )
 
         @test size(H) == (2, 3)
