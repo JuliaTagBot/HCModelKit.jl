@@ -22,5 +22,5 @@ J′ = subs(J, vars => y)
 Nx = (vars - y) - J' * v
 Ny = (vars - y) - J′' * w
 
-F = compile([f; f′; Nx; Ny], [vars; y; v; w])
+F = compile(System([f; f′; Nx; Ny], [vars; y; v; w]))
 ```
